@@ -46,7 +46,7 @@ def fetch_synonyms(cid: str, retries: int = 5, delay: int = 2) -> Optional[List[
     url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/synonyms/JSON"
     for attempt in range(retries):
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=(10, 60))
             response.raise_for_status()
             return response.json()["InformationList"]["Information"][0].get(
                 "Synonym", []
@@ -73,7 +73,7 @@ def fetch_title(cid: str, retries: int = 5, delay: int = 2) -> Optional[str]:
     url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/Title/JSON"
     for attempt in range(retries):
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=(10, 60))
             response.raise_for_status()
             return response.json()["PropertyTable"]["Properties"][0].get("Title", "")
         except (requests.exceptions.RequestException, KeyError) as e:
@@ -98,10 +98,13 @@ def fetch_canonical_smiles(cid: str, retries: int = 5, delay: int = 2) -> Option
     url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/CanonicalSMILES/JSON"
     for attempt in range(retries):
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=(10, 60))
             response.raise_for_status()
-            return response.json()["PropertyTable"]["Properties"][0].get(
-                "CanonicalSMILES", ""
+            properties = response.json()["PropertyTable"]["Properties"][0]
+            # PubChem currently returns ConnectivitySMILES for this endpoint.
+            # Keep CanonicalSMILES as a fallback for older responses.
+            return properties.get("ConnectivitySMILES") or properties.get(
+                "CanonicalSMILES"
             )
         except (requests.exceptions.RequestException, KeyError) as e:
             logging.error(f"Error on attempt {attempt + 1} for CID {cid}: {str(e)}")
@@ -129,7 +132,7 @@ def fetch_atc(cid: str, retries: int = 5, delay: int = 2) -> Optional[str]:
         try:
             if attempt > 0:
                 logging.info(f"Proceeding with attempt {attempt + 1} for CID {cid}")
-            response = requests.get(url)
+            response = requests.get(url, timeout=(10, 60))
             response.raise_for_status()
 
             data = response.json()
@@ -176,26 +179,29 @@ def main() -> None:
     Main function to fetch information for each Compound ID (CID).
     """
     setup_logging()
-    cids_file_path = Path("data/pubchem/unique_cids.json")
+    cids_file_path = Path("/home/users/h/hej/scratch/dataset/CT-ADE/pubchem/unique_cids.json")
     cids = load_cids_from_json(cids_file_path)
 
     cid_info_dict: Dict[str, Dict[str, Optional[str]]] = {}
     progress = tqdm(total=len(cids), desc="Fetching Information")
 
     for cid in cids:
-        cid_info: Dict[str, Optional[str]] = {}
-        smiles = fetch_canonical_smiles(cid)
-        if not smiles:
-            continue
-        cid_info["title"] = fetch_title(cid)
-        cid_info["synonyms"] = fetch_synonyms(cid)
-        cid_info["smiles"] = smiles
-        cid_info["atc_code"] = fetch_atc(cid)
-        cid_info_dict[cid] = cid_info
+        try:
+            cid_info: Dict[str, Optional[str]] = {}
+            smiles = fetch_canonical_smiles(cid)
+            if not smiles:
+                continue
+            cid_info["title"] = fetch_title(cid)
+            cid_info["synonyms"] = fetch_synonyms(cid)
+            cid_info["smiles"] = smiles
+            cid_info["atc_code"] = fetch_atc(cid)
+            cid_info_dict[cid] = cid_info
+        finally:
+            progress.update(1)
 
-        progress.update(1)
+    progress.close()
 
-    output_path = Path("data/pubchem/cid_details.json")
+    output_path = Path("/home/users/h/hej/scratch/dataset/CT-ADE/pubchem/cid_details.json")
     output_folder = output_path.parent
     output_folder.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:

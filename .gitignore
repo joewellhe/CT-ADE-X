@@ -1,0 +1,11 @@
+# Generated and downloaded datasets
+data/**
+
+# Keep the repository's empty data-directory placeholders
+!data/**/
+!data/**/empty.null
+
+*.sh
+
+*.log
+

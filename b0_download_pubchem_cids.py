@@ -87,10 +87,10 @@ def save_cids(cids: List[int], output_path: Path) -> None:
 
 def main() -> None:
     base_url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/annotations/heading/JSON/?source=ClinicalTrials.gov&heading_type=Compound&heading=ClinicalTrials.gov&response_type=save&response_basename=PubChemAnnotations_ClinicalTrials.gov_heading%3DClinicalTrials.gov"
-    total_pages = 12
+    total_pages = 11
     cids = fetch_and_collect_cids(base_url, total_pages)
     unique_cids = [str(cid) for cid in list(set(cids))]
-    save_directory = Path("data/pubchem")
+    save_directory = Path("/home/users/h/hej/scratch/dataset/CT-ADE/pubchem")
     output_file = "unique_cids.json"
     save_cids(unique_cids, save_directory / output_file)
 

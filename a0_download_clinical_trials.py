@@ -50,9 +50,12 @@ def main() -> None:
     Main function to handle the downloading and extracting of a ZIP file.
     """
     setup_logging()
-    url = "https://classic.clinicaltrials.gov/AllAPIJSON.zip"
-    all_cts_dir = Path('data/clinicaltrials_gov/all_cts')
-    filename = 'AllAPIJSON.zip'
+    # Official API v2 bulk download. The classic AllAPIJSON.zip endpoint was retired.
+    url = (
+        "https://clinicaltrials.gov/api/v2/studies/download?format=json.zip"
+    )
+    all_cts_dir = Path('~/scratch/dataset/CT-ADE/all_cts').expanduser()
+    filename = 'clinicaltrials-api-v2.json.zip'
 
     try:
         download_and_extract_zip(url, all_cts_dir, filename)

@@ -27,30 +27,20 @@ def load_json_data(file_path: Path) -> dict:
 
 
 def criteria_check(data: dict) -> bool:
-    """Check if the JSON data meets specific criteria: Completed, Interventional with ResultsSection."""
-    try:
-        if (
-            ("Study" in data["FullStudy"])
-            and (
-                data["FullStudy"]["Study"]["ProtocolSection"]["StatusModule"][
-                    "OverallStatus"
-                ]
-                in ["Completed", "Terminated"]
-            )
-            and (
-                data["FullStudy"]["Study"]["ProtocolSection"]["DesignModule"][
-                    "StudyType"
-                ]
-                == "Interventional"
-            )
-            and ("ResultsSection" in data["FullStudy"]["Study"])
-        ):
-            return True
-        else:
-            return False
-    except KeyError as e:
-        logging.debug(f"Key error: {str(e)} in data")
+    """Return whether an API v2 study meets the CT-ADE criteria."""
+    if not isinstance(data, dict):
         return False
+
+    protocol_section = data.get("protocolSection", {})
+    has_results = isinstance(data.get("resultsSection"), dict)
+    status = protocol_section.get("statusModule", {}).get("overallStatus")
+    study_type = protocol_section.get("designModule", {}).get("studyType")
+
+    return (
+        status in {"COMPLETED", "TERMINATED"}
+        and study_type == "INTERVENTIONAL"
+        and has_results
+    )
 
 
 def process_file(file_path: Path) -> Path:
@@ -77,8 +67,10 @@ def copy_file_to_target(source_target_tuple):
 
 def main():
     setup_logging()
-    dir_path = Path("data/clinicaltrials_gov/all_cts")
-    target_dir_path = Path("data/clinicaltrials_gov/completed_or_terminated_interventional_results_cts")
+    dir_path = Path("~/scratch/dataset/CT-ADE/all_cts").expanduser()
+    target_dir_path = dir_path.parent / (
+        "completed_or_terminated_interventional_results_cts"
+    )
     target_dir_path.mkdir(parents=True, exist_ok=True)
 
     json_paths = list(dir_path.rglob("*.json"))

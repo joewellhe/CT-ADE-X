@@ -6,224 +6,118 @@ from pathlib import Path
 import re
 from typing import Optional, Dict, Any, List, Tuple, Union
 
+CLINICAL_TRIALS_DIR = Path("~/scratch/dataset/CT-ADE").expanduser()
+INPUT_DIR = CLINICAL_TRIALS_DIR / "completed_or_terminated_interventional_results_cts"
+OUTPUT_FILE = CLINICAL_TRIALS_DIR / "preprocessed_monopharmacy_cts.json"
+
 
 def get_NCTID(ct_data: Dict) -> Optional[str]:
-    """
-    Extracts the NCT ID from clinical trial data.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: The NCT ID if found, otherwise None.
-    """
-    try:
-        return ct_data["ProtocolSection"]["IdentificationModule"]["NCTId"]
-    except:
-        return None
+    """Return the API v2 NCT identifier."""
+    return (
+        ct_data.get("protocolSection", {})
+        .get("identificationModule", {})
+        .get("nctId")
+    )
 
 
 def get_EligibilityCriteria(ct_data: Dict) -> Optional[str]:
-    """
-    Extracts the eligibility criteria from clinical trial data.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: The eligibility criteria text if found, otherwise None.
-    """
-    try:
-        return ct_data["ProtocolSection"]["EligibilityModule"]["EligibilityCriteria"]
-    except:
-        return None
+    """Return the API v2 eligibility criteria."""
+    return (
+        ct_data.get("protocolSection", {})
+        .get("eligibilityModule", {})
+        .get("eligibilityCriteria")
+    )
 
 
 def get_BriefTitle(ct_data: Dict) -> Optional[str]:
-    """
-    Extracts the brief title of a clinical trial from the trial data.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: The brief title if found, otherwise None.
-    """
     return (
-        ct_data.get("ProtocolSection", {})
-        .get("IdentificationModule", {})
-        .get("BriefTitle", None)
+        ct_data.get("protocolSection", {})
+        .get("identificationModule", {})
+        .get("briefTitle")
     )
 
 
 def get_OverallStatus(ct_data: Dict) -> Optional[str]:
-    """
-    Retrieves the overall status of the clinical trial.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: The overall status if found, otherwise None.
-    """
     return (
-        ct_data.get("ProtocolSection", {})
-        .get("StatusModule", {})
-        .get("OverallStatus", None)
+        ct_data.get("protocolSection", {})
+        .get("statusModule", {})
+        .get("overallStatus")
     )
 
 
 def get_LeadSponsorName(ct_data: Dict) -> Optional[str]:
-    """
-    Gets the name of the lead sponsor of the clinical trial.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: The lead sponsor name if available, otherwise None.
-    """
     return (
-        ct_data.get("ProtocolSection", {})
-        .get("SponsorCollaboratorsModule", {})
-        .get("LeadSponsor", {})
-        .get("LeadSponsorName", None)
+        ct_data.get("protocolSection", {})
+        .get("sponsorCollaboratorsModule", {})
+        .get("leadSponsor", {})
+        .get("name")
     )
 
 
 def get_Collaborator(ct_data: Dict) -> Optional[str]:
-    """
-    Retrieves a concatenated string of all collaborator names involved in the clinical trial.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: A string of collaborator names separated by " | ", or None if no collaborators are listed.
-    """
-    collaborator_list = (
-        ct_data.get("ProtocolSection", {})
-        .get("SponsorCollaboratorsModule", {})
-        .get("CollaboratorList", {})
-        .get("Collaborator", [])
+    collaborators = (
+        ct_data.get("protocolSection", {})
+        .get("sponsorCollaboratorsModule", {})
+        .get("collaborators", [])
     )
-    if collaborator_list:
-        collaborator_name_list = [list(i.values())[0] for i in collaborator_list]
-        return " | ".join(collaborator_name_list)
-    return None
+    names = [item["name"] for item in collaborators if item.get("name")]
+    return " | ".join(names) if names else None
 
 
 def get_HealthyVolunteers(ct_data: Dict) -> Optional[str]:
-    """
-    Indicates whether healthy volunteers are accepted in the clinical trial.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: The status of accepting healthy volunteers ("Yes" or "No"), otherwise None.
-    """
-    return (
-        ct_data.get("ProtocolSection", {})
-        .get("EligibilityModule", {})
-        .get("HealthyVolunteers", None)
+    value = (
+        ct_data.get("protocolSection", {})
+        .get("eligibilityModule", {})
+        .get("healthyVolunteers")
     )
+    if value is None:
+        return None
+    return "Yes" if value else "No"
 
 
 def get_Gender(ct_data: Dict) -> Optional[str]:
-    """
-    Retrieves the gender eligibility for the clinical trial.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: The gender requirement if specified ("All", "Male", "Female"), otherwise None.
-    """
     return (
-        ct_data.get("ProtocolSection", {})
-        .get("EligibilityModule", {})
-        .get("Gender", None)
+        ct_data.get("protocolSection", {})
+        .get("eligibilityModule", {})
+        .get("sex")
     )
 
 
 def get_stdAge(ct_data: Dict) -> Optional[str]:
-    """
-    Retrieves the standard age range(s) for eligibility in the clinical trial.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: A concatenated string of age ranges separated by " | ", or None if no specific age ranges are specified.
-    """
-    StdAge = (
-        ct_data.get("ProtocolSection", {})
-        .get("EligibilityModule", {})
-        .get("StdAgeList", {})
-        .get("StdAge", [])
+    ages = (
+        ct_data.get("protocolSection", {})
+        .get("eligibilityModule", {})
+        .get("stdAges", [])
     )
-    if StdAge:
-        return " | ".join(StdAge)
-    return None
+    return " | ".join(ages) if ages else None
 
 
 def get_Phase(ct_data: Dict) -> Optional[str]:
-    """
-    Retrieves the phase(s) of the clinical trial.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[str]: A concatenated string of phases separated by " | ", or None if no phases are specified.
-    """
-    Phase = (
-        ct_data.get("ProtocolSection", {})
-        .get("DesignModule", {})
-        .get("PhaseList", {})
-        .get("Phase", [])
+    phases = (
+        ct_data.get("protocolSection", {})
+        .get("designModule", {})
+        .get("phases", [])
     )
-    if Phase:
-        return " | ".join(Phase)
-    return None
+    return " | ".join(phases) if phases else None
 
 
 def get_EnrollmentCount(ct_data: Dict) -> Optional[int]:
-    """
-    Retrieves the enrollment count from the clinical trial data, converting it to an integer if present.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[int]: The enrollment count as an integer if the data is present and valid, otherwise None.
-    """
-    EnrollmentCount = (
-        ct_data.get("ProtocolSection", {})
-        .get("DesignModule", {})
-        .get("EnrollmentInfo", {})
-        .get("EnrollmentCount", None)
+    count = (
+        ct_data.get("protocolSection", {})
+        .get("designModule", {})
+        .get("enrollmentInfo", {})
+        .get("count")
     )
-    if EnrollmentCount:
-        try:
-            return int(EnrollmentCount)
-        except ValueError:
-            return None
-    return None
+    if count is None:
+        return None
+    try:
+        return int(count)
+    except (TypeError, ValueError):
+        return None
 
 
 def get_ct_details(ct_data: Dict) -> Dict[str, Optional[Union[str, int]]]:
-    """
-    Aggregates various details from clinical trial data into a single dictionary.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Dict[str, Optional[Union[str, int]]]: A dictionary containing key details of the clinical trial.
-    """
-    details = {
+    return {
         "title": get_BriefTitle(ct_data),
         "status": get_OverallStatus(ct_data),
         "sponsor": get_LeadSponsorName(ct_data),
@@ -234,61 +128,33 @@ def get_ct_details(ct_data: Dict) -> Dict[str, Optional[Union[str, int]]]:
         "phase": get_Phase(ct_data),
         "enrollment_count": get_EnrollmentCount(ct_data),
     }
-    return details
 
 
 def extract_interventions(ct_data: Dict) -> Optional[List[Dict]]:
-    """
-    Extracts a list of interventions from clinical trial data.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[List[Dict]]: A list of interventions, each as a dictionary; returns None if no interventions are found.
-    """
-    try:
-        # Access the intervention list from the nested dictionary structure
-        interventions = ct_data["ProtocolSection"]["ArmsInterventionsModule"][
-            "InterventionList"
-        ]["Intervention"]
-    except KeyError:
-        # Return None if the structure does not contain an InterventionList or Intervention
+    """Extract API v2 interventions and their names."""
+    interventions = (
+        ct_data.get("protocolSection", {})
+        .get("armsInterventionsModule", {})
+        .get("interventions", [])
+    )
+    if not interventions:
         return None
 
-    # List to store extracted interventions
     ct_interventions = []
-
-    # Loop through each intervention in the data
     for intervention in interventions:
-        # Extract the intervention type and name
-        intervention_type = intervention.get("InterventionType")
-        intervention_name = intervention.get("InterventionName", "")
-
-        # Extract other names for the intervention, if available
-        synonyms = intervention.get("InterventionOtherNameList", {}).get(
-            "InterventionOtherName", []
-        )
-
-        # Ensure synonyms is a list, if not, make it a list
-        if not isinstance(synonyms, list):
-            synonyms = [synonyms] if synonyms else []
-
-        # Ensure the intervention name is included in the synonyms
+        intervention_type = intervention.get("type")
+        intervention_name = intervention.get("name", "")
+        synonyms = list(intervention.get("otherNames", []))
         if intervention_name and intervention_name not in synonyms:
             synonyms.append(intervention_name)
-
-        # Create a dictionary with the intervention details
-        intervention_details = {
-            "type": intervention_type,
-            "name": intervention_name,
-            "synonyms": synonyms,
-        }
-
-        # Add the intervention details to the list
-        ct_interventions.append(intervention_details)
-
-    return ct_interventions if ct_interventions else None
+        ct_interventions.append(
+            {
+                "type": intervention_type,
+                "name": intervention_name,
+                "synonyms": synonyms,
+            }
+        )
+    return ct_interventions
 
 
 def clean_synonyms(data: List[Dict]) -> List[Dict]:
@@ -329,70 +195,45 @@ def clean_synonyms(data: List[Dict]) -> List[Dict]:
 
 
 def split_string_at_first_colon(input_string: str) -> Tuple[str, str]:
-    """
-    Splits the input string at the first occurrence of a colon.
-
-    Args:
-        input_string (str): The string to split.
-
-    Returns:
-        Tuple[str, str]: A tuple containing the parts of the string before and after the first colon.
-    """
-    colon_index = input_string.index(":")
-    before_colon = input_string[:colon_index]
-    after_colon = input_string[colon_index + 1 :]
+    """Split an API intervention name such as Drug: Aspirin."""
+    before_colon, separator, after_colon = input_string.partition(":")
+    if not separator:
+        return "", input_string
     return before_colon, after_colon
 
 
 def extract_arm_groups_with_synonyms(
     ct_data: Dict, ct_interventions: List[Dict]
 ) -> Optional[List[Dict]]:
-    """
-    Extracts arm groups and maps intervention synonyms from clinical trial data.
-
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-        ct_interventions (List[Dict]): A list of cleaned intervention data.
-
-    Returns:
-        Optional[List[Dict]]: A list of arm groups with intervention synonyms if available, otherwise None.
-    """
-    try:
-        ArmGroup = ct_data["ProtocolSection"]["ArmsInterventionsModule"][
-            "ArmGroupList"
-        ]["ArmGroup"]
-        ct_arms_groups = []
-
-        for arm_group in ArmGroup:
-            arm_group_temp = copy.deepcopy(arm_group)
-            intervention_names = arm_group.get("ArmGroupInterventionList", {}).get(
-                "ArmGroupInterventionName", []
-            )
-            arm_group_intervention_synonyms = []
-
-            for intervention_name in intervention_names:
-                _, after_colon = split_string_at_first_colon(intervention_name)
-                after_colon_clean = after_colon.lower().strip()
-                for candidate_interventions in ct_interventions:
-                    if after_colon_clean in [
-                        i.lower().strip() for i in candidate_interventions["synonyms"]
-                    ]:
-                        arm_group_intervention_synonyms.append(
-                            {intervention_name: candidate_interventions["synonyms"]}
-                        )
-
-            arm_group_temp["synonyms"] = arm_group_intervention_synonyms
-            ct_arms_groups.append(arm_group_temp)
-
-        total_arm_groups = len(ArmGroup)
-        mapped_arm_groups = len(ct_arms_groups)
-
-        if ct_arms_groups:
-            return ct_arms_groups
-        else:
-            return None
-    except KeyError:
+    """Attach API v2 intervention synonyms to each protocol arm group."""
+    arm_groups = (
+        ct_data.get("protocolSection", {})
+        .get("armsInterventionsModule", {})
+        .get("armGroups", [])
+    )
+    if not arm_groups:
         return None
+
+    processed_arm_groups = []
+    for arm_group in arm_groups:
+        processed_arm = copy.deepcopy(arm_group)
+        arm_synonyms = []
+        for intervention_name in arm_group.get("interventionNames", []):
+            _, name = split_string_at_first_colon(intervention_name)
+            normalized_name = name.lower().strip()
+            for candidate in ct_interventions:
+                normalized_synonyms = {
+                    synonym.lower().strip() for synonym in candidate["synonyms"]
+                }
+                if normalized_name in normalized_synonyms:
+                    arm_synonyms.append(
+                        {intervention_name: candidate["synonyms"]}
+                    )
+                    break
+        processed_arm["synonyms"] = arm_synonyms
+        processed_arm_groups.append(processed_arm)
+
+    return processed_arm_groups
 
 
 def remove_duplicate_dicts(data: List[Dict]) -> List[Dict]:
@@ -436,111 +277,54 @@ def sanitize_number(s: Any) -> Optional[int]:
     try:
         # Attempt to convert the cleaned string to an integer
         return int(cleaned_number)
-    except ValueError:
+    except (TypeError, ValueError):
         # If conversion fails, return None or raise an appropriate error
         return None
 
 
 def get_AdverseEvents(ct_data: Dict) -> Optional[Dict]:
-    """
-    Extracts adverse event data from clinical trial information.
+    """Extract API v2 adverse events and group their statistics by event group."""
+    module = ct_data.get("resultsSection", {}).get("adverseEventsModule", {})
+    event_groups = module.get("eventGroups", [])
+    if not event_groups:
+        return None
 
-    Args:
-        ct_data (Dict): The dictionary containing clinical trial information.
-
-    Returns:
-        Optional[Dict]: A dictionary of adverse events grouped by their IDs, or None if no data is found.
-    """
+    serious_events = module.get("seriousEvents", [])
+    other_events = module.get("otherEvents", [])
     ade_groups = {}
 
-    try:
-        event_groups = ct_data["ResultsSection"]["AdverseEventsModule"][
-            "EventGroupList"
-        ]["EventGroup"]
-    except KeyError:
-        # Handle missing EventGroupList or EventGroup
-        return None
+    def events_for_group(events: List[Dict], group_id: str) -> List[Dict]:
+        grouped_events = []
+        for event in events:
+            for stat in event.get("stats", []):
+                if stat.get("groupId") == group_id:
+                    grouped_events.append(
+                        {
+                            "ade_vocabulary": event.get("sourceVocabulary"),
+                            "ade_term": event.get("term"),
+                            "ade_organ_system": event.get("organSystem"),
+                            "ade_num_affected": sanitize_number(
+                                stat.get("numAffected")
+                            ),
+                            "ade_num_at_risk": sanitize_number(
+                                stat.get("numAtRisk")
+                            ),
+                        }
+                    )
+        return grouped_events
 
     for event_group in event_groups:
-
-        # Serious ADEs
-        serious_events = []
-        try:
-            group_key = event_group["EventGroupId"]
-            serious_event_list = ct_data["ResultsSection"]["AdverseEventsModule"][
-                "SeriousEventList"
-            ]["SeriousEvent"]
-            for serious_event in serious_event_list:
-                for stat in serious_event["SeriousEventStatsList"]["SeriousEventStats"]:
-                    if stat["SeriousEventStatsGroupId"] == group_key:
-                        serious_events.append(
-                            {
-                                "ade_vocabulary": serious_event.get(
-                                    "SeriousEventSourceVocabulary"
-                                ),
-                                "ade_term": serious_event.get(
-                                    "SeriousEventTerm"
-                                ),
-                                "ade_organ_system": serious_event.get(
-                                    "SeriousEventOrganSystem"
-                                ),
-                                "ade_num_affected": sanitize_number(
-                                    stat.get("SeriousEventStatsNumAffected")
-                                ),
-                                "ade_num_at_risk": sanitize_number(
-                                    stat.get("SeriousEventStatsNumAtRisk")
-                                ),
-                            }
-                        )
-        except KeyError:
-            pass
-
-        # Other ADEs
-        other_events = []
-        try:
-            group_key = event_group["EventGroupId"]
-            other_event_list = ct_data["ResultsSection"]["AdverseEventsModule"][
-                "OtherEventList"
-            ]["OtherEvent"]
-            for other_event in other_event_list:
-                for stat in other_event["OtherEventStatsList"]["OtherEventStats"]:
-                    if stat["OtherEventStatsGroupId"] == group_key:
-                        other_events.append(
-                            {
-                                "ade_vocabulary": other_event.get(
-                                    "OtherEventSourceVocabulary"
-                                ),
-                                "ade_term": other_event.get("OtherEventTerm"),
-                                "ade_organ_system": other_event.get(
-                                    "OtherEventOrganSystem"
-                                ),
-                                "ade_num_affected": sanitize_number(
-                                    stat.get("OtherEventStatsNumAffected")
-                                ),
-                                "ade_num_at_risk": sanitize_number(
-                                    stat.get("OtherEventStatsNumAtRisk")
-                                ),
-                            }
-                        )
-        except KeyError:
-            pass
-
-        # Summary
-        try:
-            group_key = event_group["EventGroupId"]
-            ade_groups[group_key] = {
-                "title": event_group["EventGroupTitle"],
-                "group_description": event_group["EventGroupDescription"],
-            }
-            ade_groups[group_key]["serious_events"] = serious_events
-            ade_groups[group_key]["other_events"] = other_events
-        except KeyError:
+        group_id = event_group.get("id")
+        if not group_id:
             continue
+        ade_groups[group_id] = {
+            "title": event_group.get("title"),
+            "group_description": event_group.get("description"),
+            "serious_events": events_for_group(serious_events, group_id),
+            "other_events": events_for_group(other_events, group_id),
+        }
 
-    if ade_groups:
-        return ade_groups
-    else:
-        return None
+    return ade_groups or None
 
 
 def check_for_match(list1: List[str], list2: List[str]) -> bool:
@@ -619,15 +403,15 @@ def find_arm_group_for_ade(ADE: Dict, ArmGroup: List[Dict]) -> Optional[Dict]:
     try:
         for arm_group in ArmGroup:
             matching_values = [
-                arm_group.get("ArmGroupLabel"),
-                arm_group.get("ArmGroupDescription"),
+                arm_group.get("label"),
+                arm_group.get("description"),
             ]
             # Append the tuple of the original arm group and its matching values
             arm_groups_summary.append((arm_group, matching_values))
     except KeyError:
         # Handle cases where the keys might be missing
         arm_groups_summary.append(
-            ({"ArmGroupLabel": None, "ArmGroupDescription": None}, [None, None])
+            ({"label": None, "description": None}, [None, None])
         )
 
     # Extract matching values from ADE
@@ -694,15 +478,15 @@ def group_resolution_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
         Tuple[str, Optional[Dict]]: A tuple containing the match status and the processed data, if available.
     """
     with open(ct_path, "r") as file:
-        ct_data = json.load(file)["FullStudy"]["Study"]
+        ct_data = json.load(file)
 
     NCTID = get_NCTID(ct_data)
     if not NCTID:
         return ("no_NCTID", None)
 
-    EligibilityCriteria = get_EligibilityCriteria(ct_data)
-    if not EligibilityCriteria:
-        return ("no_EligibilityCriteria", None)
+    eligibilityCriteria = get_EligibilityCriteria(ct_data)
+    if not eligibilityCriteria:
+        return ("no_eligibilityCriteria", None)
 
     ct_interventions = extract_interventions(ct_data)
     if not ct_interventions:
@@ -723,7 +507,7 @@ def group_resolution_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
     final_ct_output = {
         "nctid": NCTID,
         **trial_details,
-        "eligibility_criteria": EligibilityCriteria,
+        "eligibility_criteria": eligibilityCriteria,
         "study_groups": [],
     }
 
@@ -739,9 +523,7 @@ def group_resolution_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
                     {
                         "group_code": study_group_key,
                         "intervention_details": {
-                            "name": matching_arm_group["ArmGroupInterventionList"][
-                                "ArmGroupInterventionName"
-                            ],
+                            "name": matching_arm_group["interventionNames"],
                             "synonyms": matching_arm_group.get("synonyms", []),
                             "description": ADE["group_description"],
                         },
@@ -789,7 +571,7 @@ def is_monopharmacy_group_resolution(row: List[str]) -> bool:
     Returns:
         bool: True if it's a monopharmacy group, otherwise False.
     """
-    lst = [i.strip().lower() for i in row]
+    lst = [str(i).strip().lower() for i in row if i is not None]
     drug_count = sum([is_drug_group_resolution(x) for x in lst])
     if len(lst) == 1 and drug_count == 1:
         return True
@@ -807,7 +589,7 @@ def is_placebo_simple_preprocessing(x: Dict) -> bool:
     Returns:
         bool: True if the intervention is a placebo, otherwise False.
     """
-    return "placebo" in x["name"].lower().strip()
+    return "placebo" in str(x.get("name") or "").lower().strip()
 
 
 def is_drug_simple_preprocessing(x: Dict) -> bool:
@@ -821,8 +603,8 @@ def is_drug_simple_preprocessing(x: Dict) -> bool:
         bool: True if the intervention is a drug and not a placebo, otherwise False.
     """
     return (
-        x["type"].lower().strip() == "drug"
-        and "placebo" not in x["name"].lower().strip()
+        str(x.get("type") or "").lower().strip() == "drug"
+        and "placebo" not in str(x.get("name") or "").lower().strip()
     )
 
 
@@ -841,15 +623,15 @@ def simple_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
     final_ct_output = None  # Initialize to None
 
     with open(ct_path, "r") as file:
-        ct_data = json.load(file)["FullStudy"]["Study"]
+        ct_data = json.load(file)
 
     NCTID = get_NCTID(ct_data)
     if not NCTID:
         return ("no_NCTID", None)
 
-    EligibilityCriteria = get_EligibilityCriteria(ct_data)
-    if not EligibilityCriteria:
-        return ("no_EligibilityCriteria", None)
+    eligibilityCriteria = get_EligibilityCriteria(ct_data)
+    if not eligibilityCriteria:
+        return ("no_eligibilityCriteria", None)
 
     ct_interventions = extract_interventions(ct_data)
     if not ct_interventions:
@@ -873,7 +655,9 @@ def simple_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
                 placebo_count += 1
             elif is_drug_simple_preprocessing(intervention):
                 drug_count += 1
-                drug_clean_intervention = intervention["name"].lower().strip()
+                drug_clean_intervention = str(
+                    intervention.get("name") or ""
+                ).lower().strip()
                 selected_intervention = intervention
         except KeyError:
             placebo_count, drug_count = None, None
@@ -888,10 +672,10 @@ def simple_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
                 ) in (
                     adverse_events.items()
                 ):  # ensure 'ade_groups' is meant to be 'adverse_events'
-                    title = ade_group_value["title"].lower().strip()
+                    title = (ade_group_value.get("title") or "").lower().strip()
                     group_description = (
-                        ade_group_value["group_description"].lower().strip()
-                    )
+                        ade_group_value.get("group_description") or ""
+                    ).lower().strip()
                     if (
                         (drug_clean_intervention in title) and ("placebo" not in title)
                     ) or (
@@ -909,7 +693,7 @@ def simple_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
         final_ct_output = {
             "nctid": NCTID,
             **trial_details,
-            "eligibility_criteria": EligibilityCriteria,
+            "eligibility_criteria": eligibilityCriteria,
             "study_groups": [
                 {
                     "group_code": f"{NCTID}_{match[0]}",
@@ -934,18 +718,15 @@ def simple_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
 
 def main():
     """Main function to preprocess monopharmacy trials."""
-    # Load file paths
-    folder_path = Path(
-        "./data/clinicaltrials_gov/completed_or_terminated_interventional_results_cts"
-    )
-    all_file_paths = list(folder_path.glob("*.json"))
+    # Load API v2 records selected by a1.
+    all_file_paths = list(INPUT_DIR.glob("*.json"))
 
     ##### Simple monopharmacy pre-processing #####
 
     # Initialize dictionary for storing statistics
     statistics = {
         "no_NCTID": 0,
-        "no_EligibilityCriteria": 0,
+        "no_eligibilityCriteria": 0,
         "no_ct_interventions": 0,
         "no_adverse_events": 0,
         "no_simple_match": 0,
@@ -1021,7 +802,7 @@ def main():
     # Initialize dictionary for storing statistics
     statistics = {
         "no_NCTID": 0,
-        "no_EligibilityCriteria": 0,
+        "no_eligibilityCriteria": 0,
         "no_ct_interventions": 0,
         "no_ArmGroup_matched_to_interventions": 0,
         "no_adverse_events": 0,
@@ -1207,7 +988,7 @@ def main():
         "Unique study groups:", len(merged_preprocessing_monopharmacy_unique_group_code)
     )
 
-    file_path = Path("data/clinicaltrials_gov/preprocessed_monopharmacy_cts.json")
+    file_path = OUTPUT_FILE
     output_folder = file_path.parent
     output_folder.mkdir(parents=True, exist_ok=True)
 
