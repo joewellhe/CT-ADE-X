@@ -8,7 +8,6 @@ import itertools
 from copy import deepcopy
 from collections import Counter
 import logging
-from rdkit import Chem
 import pandas as pd
 from typing import Optional, Dict, Any, Set, List, Tuple, Iterator, TypeVar, Callable
 
@@ -220,11 +219,46 @@ def get_combined_synonyms(data: Dict[str, Any], drug_id: str) -> List[str]:
         List[str]: List of synonyms including the drug title.
     """
     candidate_data = data.get(str(drug_id), {}) or {}
-    candidate_synonyms = candidate_data.get("synonyms", []) or []
+    # Copy the list: appending the title must not mutate the loaded database.
+    candidate_synonyms = list(candidate_data.get("synonyms", []) or [])
     candidate_title = candidate_data.get("title")
     if candidate_title:
         candidate_synonyms.append(candidate_title)
     return candidate_synonyms or []
+
+
+def build_multi_drug_details(intervention_details: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convert multi-drug a2 intervention details into one record per drug."""
+    names = intervention_details.get("name", []) or []
+    synonyms_by_name = intervention_details.get("synonyms", {}) or {}
+    if not isinstance(names, list) or not isinstance(synonyms_by_name, dict):
+        return []
+
+    normalized_synonym_keys = {
+        str(name).lower().replace("drug:", "").strip(): synonyms
+        for name, synonyms in synonyms_by_name.items()
+    }
+    drugs = []
+    seen_names = set()
+    for value in names:
+        if not isinstance(value, str):
+            continue
+        clean_name = value.lower().replace("drug:", "").strip()
+        if not clean_name or clean_name in seen_names:
+            continue
+        synonyms = normalized_synonym_keys.get(clean_name, [])
+        if not isinstance(synonyms, list):
+            synonyms = []
+        drugs.append(
+            {
+                "name": value,
+                "synonyms": list(dict.fromkeys(
+                    [item for item in synonyms if isinstance(item, str)]
+                )),
+            }
+        )
+        seen_names.add(clean_name)
+    return drugs
 
 
 def get_title(data: Dict[str, Any], drug_id: str) -> Optional[str]:
@@ -318,41 +352,50 @@ def process_trial_group(
     # Process each trial in the chunk
     for nctid, trial in trial_chunk.items():
         for study_group in trial["study_groups"]:
-            if "smiles" in study_group["intervention_details"]:
-                continue
             intervention_details = study_group["intervention_details"]
-            raw_intervention_name = (
-                intervention_details["name"][0].lower().replace("drug:", "").strip()
-            )
-            intervention_synonyms = normalize_synonyms(
-                [raw_intervention_name] + intervention_details.get("synonyms", []),
-                sanitize=sanitize,
-            )
+            if "drugs" not in intervention_details:
+                intervention_details["drugs"] = build_multi_drug_details(
+                    intervention_details
+                )
 
-            for drug_id, synonyms, title, atc_code, source in zip(
-                all_drug_ids,
-                candidate_drug_ids_synonyms,
-                candidate_drug_ids_titles,
-                candidate_drug_ids_atc_codes,
-                candidate_sources,
-            ):
-                matched_name = match_function(synonyms, intervention_synonyms)
-                if matched_name:
-                    canonical_name = title or matched_name.lower().strip()
-                    smiles = drug_id_details_global.get(drug_id, {}).get("smiles")
-                    if canonical_name and smiles:
-                        unique_smiles_mapped.add(smiles)
-                        mapped_study_group_codes.add(study_group["group_code"])
-                        intervention_details.update(
-                            {
-                                "canonical_name": canonical_name,
-                                "drug_id": drug_id,
-                                "smiles": smiles,
-                                "drug_info_source": source,
-                                "atc_code": atc_code,
-                            }
-                        )
-                        break
+            for drug in intervention_details["drugs"]:
+                if "smiles" in drug:
+                    continue
+                raw_intervention_name = (
+                    drug["name"].lower().replace("drug:", "").strip()
+                )
+                intervention_synonyms = normalize_synonyms(
+                    [raw_intervention_name] + drug.get("synonyms", []),
+                    sanitize=sanitize,
+                )
+
+                for drug_id, synonyms, title, atc_code, source in zip(
+                    all_drug_ids,
+                    candidate_drug_ids_synonyms,
+                    candidate_drug_ids_titles,
+                    candidate_drug_ids_atc_codes,
+                    candidate_sources,
+                ):
+                    matched_name = match_function(synonyms, intervention_synonyms)
+                    if matched_name:
+                        canonical_name = title or matched_name.lower().strip()
+                        smiles = drug_id_details_global.get(drug_id, {}).get("smiles")
+                        if canonical_name and smiles:
+                            unique_smiles_mapped.add(smiles)
+                            drug.update(
+                                {
+                                    "canonical_name": canonical_name,
+                                    "drug_id": drug_id,
+                                    "smiles": smiles,
+                                    "drug_info_source": source,
+                                    "atc_code": atc_code,
+                                }
+                            )
+                            break
+
+            drugs = intervention_details["drugs"]
+            if len(drugs) >= 2 and all("smiles" in drug for drug in drugs):
+                mapped_study_group_codes.add(study_group["group_code"])
         modified_trial_data[nctid] = trial
 
     return modified_trial_data, mapped_study_group_codes, unique_smiles_mapped
@@ -462,7 +505,8 @@ def collect_mapped_study_groups(
     mapped_study_groups = []
     for nct_id, trial in preprocessed_trials.items():
         for study_group in trial["study_groups"]:
-            if "smiles" in study_group["intervention_details"]:
+            drugs = study_group["intervention_details"].get("drugs", [])
+            if len(drugs) >= 2 and all("smiles" in drug for drug in drugs):
                 combined_data = {
                     "nctid": trial["nctid"],
                     "title": trial["title"],
@@ -515,12 +559,9 @@ def tabularize_study_groups(study_groups: List[Dict[str, Any]]) -> pd.DataFrame:
             "eligibility_criteria": group["eligibility_criteria"],
             "group_id": group["group_code"],
             "group_description": group["intervention_details"]["description"],
-            "ct_intervention_name": group["intervention_details"]["name"][0],
-            "canonical_name": group["intervention_details"]["canonical_name"],
-            "drug_info_source": group["intervention_details"]["drug_info_source"],
-            "drug_id": group["intervention_details"]["drug_id"],
-            "smiles": group["intervention_details"]["smiles"],
-            "atc_code": group["intervention_details"]["atc_code"],
+            "Drugs": json.dumps(
+                group["intervention_details"]["drugs"], ensure_ascii=False
+            ),
         }
 
         # Function to add adverse events to the list
@@ -585,23 +626,26 @@ def calculate_intervention_name_mapping(
 
     for nctid, trial in preprocessed_trials.items():
         for study_group in trial["study_groups"]:
-            # Collect raw intervention names
-            intervention_name = (
-                study_group["intervention_details"]["name"][0]
-                .lower()
-                .replace("drug:", "")
-                .strip()
-            )
-            all_intervention_names.add(intervention_name)
-
-            # Check if this study group was mapped
-            if "canonical_name" in study_group["intervention_details"]:
-                mapped_intervention_names.add(intervention_name)
+            intervention_details = study_group["intervention_details"]
+            drugs = intervention_details.get("drugs")
+            if drugs is None:
+                drugs = build_multi_drug_details(intervention_details)
+            for drug in drugs:
+                intervention_name = (
+                    drug["name"].lower().replace("drug:", "").strip()
+                )
+                all_intervention_names.add(intervention_name)
+                if "smiles" in drug:
+                    mapped_intervention_names.add(intervention_name)
 
     # Calculate the mapping statistics
     total_intervention_names = len(all_intervention_names)
     mapped_names_count = len(mapped_intervention_names)
-    mapping_percentage = (mapped_names_count / total_intervention_names) * 100
+    mapping_percentage = (
+        (mapped_names_count / total_intervention_names) * 100
+        if total_intervention_names
+        else 0.0
+    )
 
     return total_intervention_names, mapped_names_count, mapping_percentage
 
@@ -611,15 +655,15 @@ def main() -> None:
     Main function that orchestrates the execution of the ade data mapping pipeline.
     """
     # Load data from JSON files
-    preprocessed_monopharmacy_cts_mapped = read_json_file(
-        "./data/clinicaltrials_gov/preprocessed_monopharmacy_cts.json"
+    preprocessed_multi_drug_cts_mapped = read_json_file(
+        "./data/clinicaltrials_gov/preprocessed_multi_drug_cts.json"
     )
     loaded_compound_details = read_json_file(
         "./data/unified_chemical_database/unified_chemical_database.json"
     )
 
     # Count the number of unique study groups
-    unique_study_group_count = count_study_groups(preprocessed_monopharmacy_cts_mapped)
+    unique_study_group_count = count_study_groups(preprocessed_multi_drug_cts_mapped)
     print(f"Loaded data has {unique_study_group_count} unique study groups")
 
     # Initialize sets to store combined codes and smiles
@@ -628,11 +672,11 @@ def main() -> None:
 
     # Exact matching
     (
-        preprocessed_monopharmacy_cts_mapped,
+        preprocessed_multi_drug_cts_mapped,
         codes_exact,
         smiles_exact,
     ) = process_matching_multiprocessing(
-        preprocessed_monopharmacy_cts_mapped,
+        preprocessed_multi_drug_cts_mapped,
         loaded_compound_details,
         find_exact_match,
         sanitize=False,
@@ -642,11 +686,11 @@ def main() -> None:
 
     # Partial matching
     (
-        preprocessed_monopharmacy_cts_mapped,
+        preprocessed_multi_drug_cts_mapped,
         codes_partial,
         smiles_partial,
     ) = process_matching_multiprocessing(
-        preprocessed_monopharmacy_cts_mapped,
+        preprocessed_multi_drug_cts_mapped,
         loaded_compound_details,
         find_partial_match,
         sanitize=False,
@@ -656,11 +700,11 @@ def main() -> None:
 
     # Pre-processed exact matching
     (
-        preprocessed_monopharmacy_cts_mapped,
+        preprocessed_multi_drug_cts_mapped,
         codes_pre_exact,
         smiles_pre_exact,
     ) = process_matching_multiprocessing(
-        preprocessed_monopharmacy_cts_mapped,
+        preprocessed_multi_drug_cts_mapped,
         loaded_compound_details,
         find_exact_match,
         sanitize=True,
@@ -670,11 +714,11 @@ def main() -> None:
 
     # Pre-processed partial matching
     (
-        preprocessed_monopharmacy_cts_mapped,
+        preprocessed_multi_drug_cts_mapped,
         codes_pre_partial,
         smiles_pre_partial,
     ) = process_matching_multiprocessing(
-        preprocessed_monopharmacy_cts_mapped,
+        preprocessed_multi_drug_cts_mapped,
         loaded_compound_details,
         find_partial_match,
         sanitize=True,
@@ -686,7 +730,11 @@ def main() -> None:
     print_summary("Final Combined Results", all_mapped_codes, all_unique_smiles)
 
     # Compute the final mapping percentage
-    mapped_percentage = (len(all_mapped_codes) / unique_study_group_count) * 100
+    mapped_percentage = (
+        (len(all_mapped_codes) / unique_study_group_count) * 100
+        if unique_study_group_count
+        else 0.0
+    )
     print(
         f"Among the {unique_study_group_count} unique study groups, {len(all_mapped_codes)} were mapped ({mapped_percentage:.2f}%)\n"
     )
@@ -700,14 +748,14 @@ def main() -> None:
         total_intervention_names,
         mapped_names_count,
         mapping_percentage,
-    ) = calculate_intervention_name_mapping(preprocessed_monopharmacy_cts_mapped)
+    ) = calculate_intervention_name_mapping(preprocessed_multi_drug_cts_mapped)
     print(
         f"Among all unique raw intervention names ({total_intervention_names}), {mapped_names_count} were mapped ({mapping_percentage:.2f}%)"
     )
 
     # Collect mapped study groups
     mapped_study_groups = collect_mapped_study_groups(
-        preprocessed_monopharmacy_cts_mapped
+        preprocessed_multi_drug_cts_mapped
     )
 
     # Create final tabular data

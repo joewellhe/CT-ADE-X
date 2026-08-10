@@ -54,7 +54,7 @@ def extract_drug_data(xml_file_path: str) -> Dict[str, Dict[str, list]]:
 
 
 def main():
-    xml_file_path = "data/drugbank/full database.xml"
+    xml_file_path = "data/drugbank/drugbank_full_database.xml"
     dbid_info = extract_drug_data(xml_file_path)
 
     output_path = Path("data/drugbank/dbid_details.json")

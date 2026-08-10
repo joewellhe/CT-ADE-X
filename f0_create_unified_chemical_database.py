@@ -396,11 +396,13 @@ def save_unified_database(
 def main() -> None:
 
     # Load databases
+    dbid_details = read_json_file("./data/drugbank/dbid_details.json")
     chembl_approved_details = read_json_file("./data/chembl_approved/chembl_approved_details.json")
     chembl_usan_details = read_json_file("./data/chembl_usan/chembl_usan_details.json")
-    cid_details = read_json_file("/home/users/h/hej/scratch/dataset/CT-ADE/pubchem/cid_details.json")
+    cid_details = read_json_file("./data/pubchem/cid_details.json")
 
     # Standardize SMILES and update synonyms with title in each database
+    dbid_details = canonicalize_and_update_synonyms(dbid_details, "DrugBank")
     chembl_approved_details = canonicalize_and_update_synonyms(chembl_approved_details, "ChEMBL")
     chembl_usan_details = canonicalize_and_update_synonyms(chembl_usan_details, "ChEMBL")
     cid_details = canonicalize_and_update_synonyms(cid_details, "PubChem")
@@ -412,7 +414,7 @@ def main() -> None:
 
     # Create unified database
     unified_database = create_unified_database(
-        chembl_approved_details, chembl_usan_details, cid_details
+        dbid_details, chembl_approved_details, chembl_usan_details, cid_details
     )
 
     # Clean overlapping synonyms

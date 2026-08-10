@@ -1,1001 +1,440 @@
-import copy
+"""Extract multi-drug result groups and their adverse events.
+
+The script uses participant-flow groups as the source of result groups.  A
+study must first have a protocol arm explicitly associated with at least two
+active DRUG interventions.  A participant-flow group is retained only when
+its title and description identify at least two distinct active drugs.
+"""
+
+import argparse
 import json
+import logging
 import multiprocessing
-from tqdm.auto import tqdm
-from pathlib import Path
 import re
-from typing import Optional, Dict, Any, List, Tuple, Union
+import unicodedata
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-CLINICAL_TRIALS_DIR = Path("~/scratch/dataset/CT-ADE").expanduser()
-INPUT_DIR = CLINICAL_TRIALS_DIR / "completed_or_terminated_interventional_results_cts"
-OUTPUT_FILE = CLINICAL_TRIALS_DIR / "preprocessed_monopharmacy_cts.json"
+from tqdm.auto import tqdm
 
+DEFAULT_INPUT_DIR = Path(
+    "~/scratch/dataset/CT-ADE/completed_or_terminated_interventional_results_cts"
+).expanduser()
+DEFAULT_OUTPUT_FILE = Path(
+    "~/scratch/dataset/CT-ADE/preprocessed_multi_drug_cts.json"
+).expanduser()
 
-def get_NCTID(ct_data: Dict) -> Optional[str]:
-    """Return the API v2 NCT identifier."""
-    return (
-        ct_data.get("protocolSection", {})
-        .get("identificationModule", {})
-        .get("nctId")
-    )
-
-
-def get_EligibilityCriteria(ct_data: Dict) -> Optional[str]:
-    """Return the API v2 eligibility criteria."""
-    return (
-        ct_data.get("protocolSection", {})
-        .get("eligibilityModule", {})
-        .get("eligibilityCriteria")
-    )
+PLACEBO_RE = re.compile(r"\b(placebo|sham|dummy)\b", re.IGNORECASE)
+def normalize_text(value: Any) -> str:
+    """Normalize text while retaining token boundaries for safe matching."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    return " ".join(text.split())
 
 
-def get_BriefTitle(ct_data: Dict) -> Optional[str]:
-    return (
-        ct_data.get("protocolSection", {})
-        .get("identificationModule", {})
-        .get("briefTitle")
-    )
+def contains_alias(text: str, alias: str) -> bool:
+    """Match a normalized alias as complete tokens, never as a substring."""
+    normalized_alias = normalize_text(alias)
+    if not normalized_alias:
+        return False
+    return re.search(
+        rf"(?<!\w){re.escape(normalized_alias)}(?!\w)", normalize_text(text)
+    ) is not None
 
 
-def get_OverallStatus(ct_data: Dict) -> Optional[str]:
-    return (
-        ct_data.get("protocolSection", {})
-        .get("statusModule", {})
-        .get("overallStatus")
-    )
+def is_placebo(value: Any) -> bool:
+    return PLACEBO_RE.search(str(value or "")) is not None
 
 
-def get_LeadSponsorName(ct_data: Dict) -> Optional[str]:
-    return (
-        ct_data.get("protocolSection", {})
-        .get("sponsorCollaboratorsModule", {})
-        .get("leadSponsor", {})
-        .get("name")
-    )
+def get_nested(study: Dict, *keys: str, default: Any = None) -> Any:
+    value: Any = study
+    for key in keys:
+        if not isinstance(value, dict):
+            return default
+        value = value.get(key)
+    return default if value is None else value
 
 
-def get_Collaborator(ct_data: Dict) -> Optional[str]:
-    collaborators = (
-        ct_data.get("protocolSection", {})
-        .get("sponsorCollaboratorsModule", {})
-        .get("collaborators", [])
-    )
-    names = [item["name"] for item in collaborators if item.get("name")]
-    return " | ".join(names) if names else None
-
-
-def get_HealthyVolunteers(ct_data: Dict) -> Optional[str]:
-    value = (
-        ct_data.get("protocolSection", {})
-        .get("eligibilityModule", {})
-        .get("healthyVolunteers")
-    )
-    if value is None:
-        return None
-    return "Yes" if value else "No"
-
-
-def get_Gender(ct_data: Dict) -> Optional[str]:
-    return (
-        ct_data.get("protocolSection", {})
-        .get("eligibilityModule", {})
-        .get("sex")
-    )
-
-
-def get_stdAge(ct_data: Dict) -> Optional[str]:
-    ages = (
-        ct_data.get("protocolSection", {})
-        .get("eligibilityModule", {})
-        .get("stdAges", [])
-    )
-    return " | ".join(ages) if ages else None
-
-
-def get_Phase(ct_data: Dict) -> Optional[str]:
-    phases = (
-        ct_data.get("protocolSection", {})
-        .get("designModule", {})
-        .get("phases", [])
-    )
-    return " | ".join(phases) if phases else None
-
-
-def get_EnrollmentCount(ct_data: Dict) -> Optional[int]:
-    count = (
-        ct_data.get("protocolSection", {})
-        .get("designModule", {})
-        .get("enrollmentInfo", {})
-        .get("count")
-    )
-    if count is None:
-        return None
+def get_trial_details(study: Dict) -> Dict[str, Any]:
+    protocol = study.get("protocolSection", {})
+    identification = protocol.get("identificationModule", {})
+    status = protocol.get("statusModule", {})
+    sponsor = protocol.get("sponsorCollaboratorsModule", {})
+    eligibility = protocol.get("eligibilityModule", {})
+    design = protocol.get("designModule", {})
+    enrollment = design.get("enrollmentInfo", {}).get("count")
     try:
-        return int(count)
+        enrollment = int(enrollment) if enrollment is not None else None
     except (TypeError, ValueError):
-        return None
-
-
-def get_ct_details(ct_data: Dict) -> Dict[str, Optional[Union[str, int]]]:
+        enrollment = None
+    collaborators = [
+        item.get("name")
+        for item in sponsor.get("collaborators", [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    healthy = eligibility.get("healthyVolunteers")
     return {
-        "title": get_BriefTitle(ct_data),
-        "status": get_OverallStatus(ct_data),
-        "sponsor": get_LeadSponsorName(ct_data),
-        "collaborators": get_Collaborator(ct_data),
-        "healthy_volunteers": get_HealthyVolunteers(ct_data),
-        "gender": get_Gender(ct_data),
-        "age": get_stdAge(ct_data),
-        "phase": get_Phase(ct_data),
-        "enrollment_count": get_EnrollmentCount(ct_data),
+        "title": identification.get("briefTitle"),
+        "status": status.get("overallStatus"),
+        "sponsor": sponsor.get("leadSponsor", {}).get("name"),
+        "collaborators": " | ".join(collaborators) if collaborators else None,
+        "healthy_volunteers": (
+            None if healthy is None else ("Yes" if healthy else "No")
+        ),
+        "gender": eligibility.get("sex"),
+        "age": " | ".join(eligibility.get("stdAges", [])) or None,
+        "phase": " | ".join(design.get("phases", [])) or None,
+        "enrollment_count": enrollment,
+        "eligibility_criteria": eligibility.get("eligibilityCriteria"),
     }
 
 
-def extract_interventions(ct_data: Dict) -> Optional[List[Dict]]:
-    """Extract API v2 interventions and their names."""
-    interventions = (
-        ct_data.get("protocolSection", {})
-        .get("armsInterventionsModule", {})
-        .get("interventions", [])
+def extract_active_drugs(study: Dict) -> List[Dict[str, Any]]:
+    """Extract distinct active DRUG records and unambiguous aliases."""
+    interventions = get_nested(
+        study,
+        "protocolSection",
+        "armsInterventionsModule",
+        "interventions",
+        default=[],
     )
-    if not interventions:
-        return None
-
-    ct_interventions = []
-    for intervention in interventions:
-        intervention_type = intervention.get("type")
-        intervention_name = intervention.get("name", "")
-        synonyms = list(intervention.get("otherNames", []))
-        if intervention_name and intervention_name not in synonyms:
-            synonyms.append(intervention_name)
-        ct_interventions.append(
+    drugs: List[Dict[str, Any]] = []
+    seen_names: Set[str] = set()
+    for intervention in interventions if isinstance(interventions, list) else []:
+        if not isinstance(intervention, dict):
+            continue
+        name = str(intervention.get("name") or "").strip()
+        if str(intervention.get("type") or "").casefold() != "drug":
+            continue
+        if not name or is_placebo(name):
+            continue
+        key = normalize_text(name)
+        if not key or key in seen_names:
+            continue
+        aliases = [name]
+        for alias in intervention.get("otherNames", []):
+            if isinstance(alias, str) and alias.strip() and not is_placebo(alias):
+                aliases.append(alias.strip())
+        unique_aliases = list(dict.fromkeys(aliases))
+        drugs.append(
             {
-                "type": intervention_type,
-                "name": intervention_name,
-                "synonyms": synonyms,
+                "drug_id": len(drugs),
+                "name": name,
+                "aliases": unique_aliases,
+                "primary_aliases": [name],
             }
         )
-    return ct_interventions
+        seen_names.add(key)
 
-
-def clean_synonyms(data: List[Dict]) -> List[Dict]:
-    """
-    Removes synonyms that map to more than one intervention name from the data.
-
-    Args:
-        data (List[Dict]): A list of dictionaries, each representing an intervention with a list of synonyms.
-
-    Returns:
-        List[Dict]: The updated list of interventions with cleaned synonyms.
-    """
-    data_copy = copy.deepcopy(data)
-    synonym_map = {}
-
-    # Map each synonym to the names it's associated with
-    for item in data_copy:
-        name = item["name"]
-        for synonym in item["synonyms"]:
-            if synonym not in synonym_map:
-                synonym_map[synonym] = set()
-            synonym_map[synonym].add(name)
-
-    # Find all synonyms associated with more than one name
-    synonyms_to_remove = {
-        syn: names for syn, names in synonym_map.items() if len(names) > 1
-    }
-
-    # Clean data by removing problematic synonyms
-    for item in data_copy:
-        original_synonyms = item["synonyms"]
-        cleaned_synonyms = [
-            syn for syn in original_synonyms if syn not in synonyms_to_remove
+    # As in the original a2 clean_synonyms(), discard aliases shared by
+    # different intervention records. Primary names remain usable as names.
+    owners: Dict[str, Set[int]] = {}
+    for drug in drugs:
+        for alias in drug["aliases"]:
+            owners.setdefault(normalize_text(alias), set()).add(drug["drug_id"])
+    for drug in drugs:
+        drug["aliases"] = [
+            alias
+            for alias in drug["aliases"]
+            if len(owners.get(normalize_text(alias), set())) == 1
         ]
-        item["synonyms"] = cleaned_synonyms
-
-    return data_copy
+    return drugs
 
 
-def split_string_at_first_colon(input_string: str) -> Tuple[str, str]:
-    """Split an API intervention name such as Drug: Aspirin."""
-    before_colon, separator, after_colon = input_string.partition(":")
-    if not separator:
-        return "", input_string
-    return before_colon, after_colon
+def intervention_reference_name(value: Any) -> str:
+    text = str(value or "")
+    prefix, separator, remainder = text.partition(":")
+    return remainder.strip() if separator and prefix.strip().casefold() == "drug" else text.strip()
 
 
-def extract_arm_groups_with_synonyms(
-    ct_data: Dict, ct_interventions: List[Dict]
-) -> Optional[List[Dict]]:
-    """Attach API v2 intervention synonyms to each protocol arm group."""
-    arm_groups = (
-        ct_data.get("protocolSection", {})
-        .get("armsInterventionsModule", {})
-        .get("armGroups", [])
+def resolve_drug_reference(reference: str, drugs: Sequence[Dict]) -> Optional[int]:
+    normalized = normalize_text(intervention_reference_name(reference))
+    matches = []
+    for drug in drugs:
+        candidates = {normalize_text(drug["name"])} | {
+            normalize_text(alias) for alias in drug["aliases"]
+        }
+        if normalized in candidates:
+            matches.append(drug["drug_id"])
+    return matches[0] if len(matches) == 1 else None
+
+
+def find_protocol_multi_drug_arms(study: Dict, drugs: Sequence[Dict]) -> List[Dict]:
+    """Step 1: find arms explicitly linked to at least two active drugs."""
+    arms = get_nested(
+        study, "protocolSection", "armsInterventionsModule", "armGroups", default=[]
     )
-    if not arm_groups:
-        return None
-
-    processed_arm_groups = []
-    for arm_group in arm_groups:
-        processed_arm = copy.deepcopy(arm_group)
-        arm_synonyms = []
-        for intervention_name in arm_group.get("interventionNames", []):
-            _, name = split_string_at_first_colon(intervention_name)
-            normalized_name = name.lower().strip()
-            for candidate in ct_interventions:
-                normalized_synonyms = {
-                    synonym.lower().strip() for synonym in candidate["synonyms"]
+    selected = []
+    for arm in arms if isinstance(arms, list) else []:
+        if not isinstance(arm, dict):
+            continue
+        drug_ids = {
+            resolved
+            for reference in arm.get("interventionNames", [])
+            if not is_placebo(reference)
+            for resolved in [resolve_drug_reference(reference, drugs)]
+            if resolved is not None
+        }
+        if len(drug_ids) >= 2:
+            selected.append(
+                {
+                    "label": arm.get("label"),
+                    "description": arm.get("description"),
+                    "drug_ids": sorted(drug_ids),
                 }
-                if normalized_name in normalized_synonyms:
-                    arm_synonyms.append(
-                        {intervention_name: candidate["synonyms"]}
-                    )
-                    break
-        processed_arm["synonyms"] = arm_synonyms
-        processed_arm_groups.append(processed_arm)
-
-    return processed_arm_groups
+            )
+    return selected
 
 
-def remove_duplicate_dicts(data: List[Dict]) -> List[Dict]:
-    """
-    Removes duplicate dictionaries from a list based on their JSON string representation.
-
-    Args:
-        data (List[Dict]): The list of dictionaries from which to remove duplicates.
-
-    Returns:
-        List[Dict]: A list containing only unique dictionaries.
-    """
-    # Use a set to track unique dictionary entries based on their JSON string representation
-    unique_dicts = set()
-    # List to hold the final unique dictionaries
-    unique_data = []
-
-    for entry in data:
-        # Convert dictionary to a JSON string
-        entry_str = json.dumps(entry, sort_keys=True)
-        # Check if the JSON string is not already in the set
-        if entry_str not in unique_dicts:
-            unique_dicts.add(entry_str)
-            unique_data.append(entry)
-
-    return unique_data
+def matched_drugs(text: str, drugs: Sequence[Dict], use_synonyms: bool) -> Set[int]:
+    matches = set()
+    for drug in drugs:
+        aliases = drug["aliases"] if use_synonyms else drug["primary_aliases"]
+        if any(contains_alias(text, alias) for alias in aliases):
+            matches.add(drug["drug_id"])
+    return matches
 
 
-def sanitize_number(s: Any) -> Optional[int]:
-    """
-    Attempts to sanitize and convert a string to an integer, removing non-numeric characters except for the decimal point and minus sign.
+def extract_multi_drug_result_groups(study: Dict, drugs: Sequence[Dict]) -> List[Dict]:
+    """Step 2: retain participant-flow groups naming two or more drugs."""
+    groups = get_nested(
+        study, "resultsSection", "participantFlowModule", "groups", default=[]
+    )
+    selected = []
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict):
+            continue
+        title = str(group.get("title") or "")
+        description = str(group.get("description") or "")
+        text = f"{title} {description}"
+        direct = matched_drugs(text, drugs, use_synonyms=False)
+        match_method = "name"
+        drug_ids = direct
+        if len(drug_ids) < 2:
+            drug_ids = matched_drugs(text, drugs, use_synonyms=True)
+            match_method = "name_or_synonym"
+        if len(drug_ids) >= 2:
+            selected.append(
+                {
+                    "id": group.get("id"),
+                    "title": group.get("title"),
+                    "description": group.get("description"),
+                    "drug_ids": sorted(drug_ids),
+                    "drug_match_method": match_method,
+                }
+            )
+    return selected
 
-    Args:
-        s (Any): The input string to sanitize.
 
-    Returns:
-        Optional[int]: The sanitized number as an integer if conversion is successful, otherwise None.
-    """
-    # Remove non-numeric characters except for the decimal point and minus sign
-    cleaned_number = re.sub(r"[^\d.-]", "", str(s))
+def sanitize_number(value: Any) -> Optional[int]:
+    cleaned = re.sub(r"[^\d.-]", "", str(value))
     try:
-        # Attempt to convert the cleaned string to an integer
-        return int(cleaned_number)
+        return int(cleaned)
     except (TypeError, ValueError):
-        # If conversion fails, return None or raise an appropriate error
         return None
 
 
-def get_AdverseEvents(ct_data: Dict) -> Optional[Dict]:
-    """Extract API v2 adverse events and group their statistics by event group."""
-    module = ct_data.get("resultsSection", {}).get("adverseEventsModule", {})
-    event_groups = module.get("eventGroups", [])
-    if not event_groups:
-        return None
+def extract_adverse_event_groups(study: Dict) -> List[Dict]:
+    module = get_nested(study, "resultsSection", "adverseEventsModule", default={})
+    event_groups = module.get("eventGroups", []) if isinstance(module, dict) else []
 
-    serious_events = module.get("seriousEvents", [])
-    other_events = module.get("otherEvents", [])
-    ade_groups = {}
-
-    def events_for_group(events: List[Dict], group_id: str) -> List[Dict]:
-        grouped_events = []
+    def events_for_group(events: Iterable[Dict], group_id: str) -> List[Dict]:
+        output = []
         for event in events:
+            if not isinstance(event, dict):
+                continue
             for stat in event.get("stats", []):
-                if stat.get("groupId") == group_id:
-                    grouped_events.append(
+                if isinstance(stat, dict) and stat.get("groupId") == group_id:
+                    output.append(
                         {
                             "ade_vocabulary": event.get("sourceVocabulary"),
                             "ade_term": event.get("term"),
                             "ade_organ_system": event.get("organSystem"),
-                            "ade_num_affected": sanitize_number(
-                                stat.get("numAffected")
-                            ),
-                            "ade_num_at_risk": sanitize_number(
-                                stat.get("numAtRisk")
-                            ),
+                            "ade_num_affected": sanitize_number(stat.get("numAffected")),
+                            "ade_num_at_risk": sanitize_number(stat.get("numAtRisk")),
                         }
                     )
-        return grouped_events
+        return output
 
-    for event_group in event_groups:
-        group_id = event_group.get("id")
-        if not group_id:
+    output = []
+    for group in event_groups if isinstance(event_groups, list) else []:
+        if not isinstance(group, dict) or not group.get("id"):
             continue
-        ade_groups[group_id] = {
-            "title": event_group.get("title"),
-            "group_description": event_group.get("description"),
-            "serious_events": events_for_group(serious_events, group_id),
-            "other_events": events_for_group(other_events, group_id),
-        }
-
-    return ade_groups or None
-
-
-def check_for_match(list1: List[str], list2: List[str]) -> bool:
-    """
-    Checks for any common element between two lists.
-
-    Args:
-        list1 (List[str]): The first list of strings.
-        list2 (List[str]): The second list of strings.
-
-    Returns:
-        bool: True if there is at least one common element, otherwise False.
-    """
-    # Create sets from the lists for efficient lookup, excluding None
-    set1 = set(str(item).strip().lower() for item in list1 if item is not None)
-    set2 = set(str(item).strip().lower() for item in list2 if item is not None)
-
-    # Check for any common element in both sets
-    for item in set1:
-        if item in set2:
-            return True
-
-    return False
-
-
-def check_strict_match(list1: List[str], list2: List[str]) -> bool:
-    """
-    Checks for a strict match between two lists, where all elements must match exactly without duplicates.
-
-    Args:
-        list1 (List[str]): The first list of strings.
-        list2 (List[str]): The second list of strings.
-
-    Returns:
-        bool: True if the lists strictly match, otherwise False.
-    """
-    set1 = set(str(item).strip().lower() for item in list1 if item is not None)
-    set2 = set(str(item).strip().lower() for item in list2 if item is not None)
-
-    if len(set1) != len(set2) or len(set1) != len(list1):
-        # If the lengths of the sets or the length of set1 and list1 differ,
-        # it means there are duplicates or None values, so strict matching is not possible
-        return False
-
-    matched = set()
-    for item1 in set1:
-        match_found = False
-        for item2 in set2:
-            if item1 == item2 and item2 not in matched:
-                match_found = True
-                matched.add(item2)
-                break
-        if not match_found:
-            return False
-
-    return True
-
-
-def find_arm_group_for_ade(ADE: Dict, ArmGroup: List[Dict]) -> Optional[Dict]:
-    """
-    Attempts to match an ADE to an arm group based on their descriptions.
-
-    Args:
-        ADE (Dict): The adverse event group data.
-        ArmGroup (List[Dict]): A list of arm group data.
-
-    Returns:
-        Optional[Dict]: The matching arm group if found, otherwise None.
-    """
-    # Initialize the variables to track the matching arm group and count of matches
-    matching_arm_group = None
-    matches_found = 0
-
-    # Prepare a list of tuples where each tuple contains the arm group and its matching values
-    arm_groups_summary = []
-    try:
-        for arm_group in ArmGroup:
-            matching_values = [
-                arm_group.get("label"),
-                arm_group.get("description"),
-            ]
-            # Append the tuple of the original arm group and its matching values
-            arm_groups_summary.append((arm_group, matching_values))
-    except KeyError:
-        # Handle cases where the keys might be missing
-        arm_groups_summary.append(
-            ({"label": None, "description": None}, [None, None])
+        group_id = group["id"]
+        output.append(
+            {
+                "id": group_id,
+                "title": group.get("title"),
+                "description": group.get("description"),
+                "serious_events": events_for_group(module.get("seriousEvents", []), group_id),
+                "other_events": events_for_group(module.get("otherEvents", []), group_id),
+            }
         )
-
-    # Extract matching values from ADE
-    ade_matching_values = [ADE["title"], ADE["group_description"]]
-
-    # First pass with regular matching
-    for arm_group, values in arm_groups_summary:
-        if check_for_match(ade_matching_values, values):
-            if not matching_arm_group:
-                matching_arm_group = arm_group  # Store the original arm group
-            matches_found += 1
-
-    # Apply stricter matching criteria if more than one match is found
-    if matches_found > 1:
-        matching_arm_group = None
-        matches_found = 0
-        for arm_group, values in arm_groups_summary:
-            if check_strict_match(ade_matching_values, values):
-                matching_arm_group = arm_group  # Store the original arm group
-                matches_found += 1
-
-    # Ensure a single, unique match was found
-    if matching_arm_group and matches_found == 1:
-        return matching_arm_group
-    else:
-        return None
+    return output
 
 
-def is_all_zeroes(lst: List[int]) -> bool:
-    """
-    Checks if all elements in the list are zero.
-
-    Args:
-        lst (List[int]): The list to check.
-
-    Returns:
-        bool: True if all elements are zero, otherwise False.
-    """
-    return all(x == 0 for x in lst)
+def normalized_values(values: Iterable[Any]) -> List[str]:
+    """Normalize non-empty matching fields in the same spirit as a2."""
+    return [normalize_text(value) for value in values if normalize_text(value)]
 
 
-def is_all_ones(lst: List[int]) -> bool:
-    """
-    Checks if all elements in the list are one.
-
-    Args:
-        lst (List[int]): The list to check.
-
-    Returns:
-        bool: True if all elements are one, otherwise False.
-    """
-    return all(x == 1 for x in lst)
+def has_regular_group_match(left: Iterable[Any], right: Iterable[Any]) -> bool:
+    """Equivalent to a2 check_for_match(): any field must equal any field."""
+    return bool(set(normalized_values(left)) & set(normalized_values(right)))
 
 
-def group_resolution_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
-    """
-    Processes a clinical trial JSON file to match adverse events to arm groups using group resolution., i.e.,
-    matching arm groups to event groups.
-
-    Args:
-        ct_path (str): The path to the clinical trial JSON file.
-
-    Returns:
-        Tuple[str, Optional[Dict]]: A tuple containing the match status and the processed data, if available.
-    """
-    with open(ct_path, "r") as file:
-        ct_data = json.load(file)
-
-    NCTID = get_NCTID(ct_data)
-    if not NCTID:
-        return ("no_NCTID", None)
-
-    eligibilityCriteria = get_EligibilityCriteria(ct_data)
-    if not eligibilityCriteria:
-        return ("no_eligibilityCriteria", None)
-
-    ct_interventions = extract_interventions(ct_data)
-    if not ct_interventions:
-        return ("no_ct_interventions", None)
-    ct_interventions = clean_synonyms(ct_interventions)
-    ct_interventions = remove_duplicate_dicts(ct_interventions)
-
-    ArmGroup = extract_arm_groups_with_synonyms(ct_data, ct_interventions)
-    if not ArmGroup:
-        return ("no_ArmGroup_matched_to_interventions", None)
-
-    adverse_events = get_AdverseEvents(ct_data)
-    if not adverse_events:
-        return ("no_adverse_events", None)
-
-    trial_details = get_ct_details(ct_data)
-
-    final_ct_output = {
-        "nctid": NCTID,
-        **trial_details,
-        "eligibility_criteria": eligibilityCriteria,
-        "study_groups": [],
-    }
-
-    arm_group_matching_log = [0] * len(adverse_events)
-    counter = 0
-
-    for group_code, ADE in adverse_events.items():
-        matching_arm_group = find_arm_group_for_ade(ADE, ArmGroup)
-        if matching_arm_group:
-            try:
-                study_group_key = f"{NCTID}_{group_code}"
-                final_ct_output["study_groups"].append(
-                    {
-                        "group_code": study_group_key,
-                        "intervention_details": {
-                            "name": matching_arm_group["interventionNames"],
-                            "synonyms": matching_arm_group.get("synonyms", []),
-                            "description": ADE["group_description"],
-                        },
-                        "adverse_events": {
-                            "serious_events": ADE.get("serious_events", []),
-                            "other_events": ADE.get("other_events", []),
-                        },
-                    }
-                )
-            except KeyError:
-                arm_group_matching_log[counter] = 1
-            counter += 1
-        else:
-            arm_group_matching_log[counter] = 1
-            counter += 1
-
-    if is_all_zeroes(arm_group_matching_log):
-        return ("fully_matched", final_ct_output)
-    elif not is_all_ones(arm_group_matching_log):
-        return ("partially_matched", final_ct_output)
-    else:
-        return ("no_matching_arm_group_at_all", None)
-
-
-def is_drug_group_resolution(x: str) -> bool:
-    """
-    Determines if the intervention details suggest a drug group that does not include a placebo.
-
-    Args:
-        x (str): The intervention detail string.
-
-    Returns:
-        bool: True if it's a drug group without a placebo, otherwise False.
-    """
-    return x.startswith("drug") and "placebo" not in x
-
-
-def is_monopharmacy_group_resolution(row: List[str]) -> bool:
-    """
-    Determines if the intervention details suggest a monopharmacy group.
-
-    Args:
-        row (List[str]): A list containing intervention details.
-
-    Returns:
-        bool: True if it's a monopharmacy group, otherwise False.
-    """
-    lst = [str(i).strip().lower() for i in row if i is not None]
-    drug_count = sum([is_drug_group_resolution(x) for x in lst])
-    if len(lst) == 1 and drug_count == 1:
-        return True
-    else:
-        return False
-
-
-def is_placebo_simple_preprocessing(x: Dict) -> bool:
-    """
-    Checks if the intervention includes a placebo.
-
-    Args:
-        x (Dict): The intervention details.
-
-    Returns:
-        bool: True if the intervention is a placebo, otherwise False.
-    """
-    return "placebo" in str(x.get("name") or "").lower().strip()
-
-
-def is_drug_simple_preprocessing(x: Dict) -> bool:
-    """
-    Checks if the intervention is a drug and does not include a placebo.
-
-    Args:
-        x (Dict): The intervention details.
-
-    Returns:
-        bool: True if the intervention is a drug and not a placebo, otherwise False.
-    """
+def has_strict_group_match(left: Iterable[Any], right: Iterable[Any]) -> bool:
+    """Equivalent to a2 check_strict_match(): both field sets must coincide."""
+    raw_left = list(left)
+    raw_right = list(right)
+    normalized_left = normalized_values(raw_left)
+    normalized_right = normalized_values(raw_right)
     return (
-        str(x.get("type") or "").lower().strip() == "drug"
-        and "placebo" not in str(x.get("name") or "").lower().strip()
+        len(normalized_left) == len(raw_left)
+        and len(normalized_right) == len(raw_right)
+        and len(normalized_left) == len(set(normalized_left))
+        and len(normalized_right) == len(set(normalized_right))
+        and set(normalized_left) == set(normalized_right)
     )
 
 
-def simple_preprocessing(ct_path: str) -> Tuple[str, Optional[Dict]]:
-    """
-    Simple preprocessing function for clinical trial data, focusing on matching drug interventions to adverse events, i.e.,
-    we process clinical trials that have only one drug across all interventions. This allows to bypass the matching between
-    arm groups and event groups.
-
-    Args:
-        ct_path (str): The path to the clinical trial JSON file.
-
-    Returns:
-        Tuple[str, Optional[Dict]]: A tuple containing the processing result type and the processed data, if any.
-    """
-    final_ct_output = None  # Initialize to None
-
-    with open(ct_path, "r") as file:
-        ct_data = json.load(file)
-
-    NCTID = get_NCTID(ct_data)
-    if not NCTID:
-        return ("no_NCTID", None)
-
-    eligibilityCriteria = get_EligibilityCriteria(ct_data)
-    if not eligibilityCriteria:
-        return ("no_eligibilityCriteria", None)
-
-    ct_interventions = extract_interventions(ct_data)
-    if not ct_interventions:
-        return ("no_ct_interventions", None)
-    ct_interventions = clean_synonyms(ct_interventions)
-    ct_interventions = remove_duplicate_dicts(ct_interventions)
-
-    adverse_events = get_AdverseEvents(ct_data)
-    if not adverse_events:
-        return ("no_adverse_events", None)
-
-    trial_details = get_ct_details(ct_data)
-
-    placebo_count = 0
-    drug_count = 0
-    selected_intervention = None
-    drug_clean_intervention = ""
-    for intervention in ct_interventions:
-        try:
-            if is_placebo_simple_preprocessing(intervention):
-                placebo_count += 1
-            elif is_drug_simple_preprocessing(intervention):
-                drug_count += 1
-                drug_clean_intervention = str(
-                    intervention.get("name") or ""
-                ).lower().strip()
-                selected_intervention = intervention
-        except KeyError:
-            placebo_count, drug_count = None, None
-
-    matches = []
-    try:
-        if drug_count == 1:
-            if adverse_events and (len(adverse_events) == placebo_count + drug_count):
-                for (
-                    ade_group_key,
-                    ade_group_value,
-                ) in (
-                    adverse_events.items()
-                ):  # ensure 'ade_groups' is meant to be 'adverse_events'
-                    title = (ade_group_value.get("title") or "").lower().strip()
-                    group_description = (
-                        ade_group_value.get("group_description") or ""
-                    ).lower().strip()
-                    if (
-                        (drug_clean_intervention in title) and ("placebo" not in title)
-                    ) or (
-                        (drug_clean_intervention in group_description)
-                        and ("placebo" not in group_description)
-                    ):
-                        matches.append(
-                            (ade_group_key, ade_group_value, selected_intervention)
-                        )
-    except KeyError:
-        matches = []
-
-    if matches and len(matches) == 1:
-        match = matches[0]
-        final_ct_output = {
-            "nctid": NCTID,
-            **trial_details,
-            "eligibility_criteria": eligibilityCriteria,
-            "study_groups": [
-                {
-                    "group_code": f"{NCTID}_{match[0]}",
-                    "intervention_details": {
-                        "name": [f"{match[2]['type']}: {match[2]['name']}"],
-                        "synonyms": match[2].get("synonyms", []),
-                        "description": match[1]["group_description"],
-                    },
-                    "adverse_events": {
-                        "serious_events": match[1].get("serious_events", []),
-                        "other_events": match[1].get("other_events", []),
-                    },
-                }
-            ],
-        }
-
-    if final_ct_output:
-        return ("simple_fully_matched", final_ct_output)
-    else:
-        return ("no_simple_match", None)
-
-
-def main():
-    """Main function to preprocess monopharmacy trials."""
-    # Load API v2 records selected by a1.
-    all_file_paths = list(INPUT_DIR.glob("*.json"))
-
-    ##### Simple monopharmacy pre-processing #####
-
-    # Initialize dictionary for storing statistics
-    statistics = {
-        "no_NCTID": 0,
-        "no_eligibilityCriteria": 0,
-        "no_ct_interventions": 0,
-        "no_adverse_events": 0,
-        "no_simple_match": 0,
-    }
-
-    # Initialize dictionary for storing parsed clinical trials data
-    parsed_cts_simple = {
-        "simple_fully_matched": {
-            "trials": [],
-            "serious_events": 0,
-            "other_events": 0,
-            "no_serious_events": 0,
-            "no_other_events": 0,
-        }
-    }
-
-    # Process each file using multiprocessing
-    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
-        results = list(
-            tqdm(
-                pool.imap(simple_preprocessing, all_file_paths),
-                total=len(all_file_paths),
-            )
+def find_event_group_for_result_group(
+    result_group: Dict, event_groups: Sequence[Dict]
+) -> Optional[Dict]:
+    """Apply the original a2 regular-then-strict title/description matching."""
+    result_values = [result_group.get("title"), result_group.get("description")]
+    regular_matches = [
+        event_group
+        for event_group in event_groups
+        if has_regular_group_match(
+            result_values,
+            [event_group.get("title"), event_group.get("description")],
         )
-
-    # Aggregate results from multiprocessing
-    for result in results:
-        result_type = result[0]
-        if result_type in ["simple_fully_matched"]:
-            # Append the clinical trial data
-            parsed_cts_simple[result_type]["trials"].append(result[1])
-
-            # Count the serious and other events in the current trial
-            for group in result[1]["study_groups"]:
-                parsed_cts_simple[result_type]["serious_events"] += (
-                    1 if len(group["adverse_events"]["serious_events"]) > 0 else 0
-                )
-                parsed_cts_simple[result_type]["other_events"] += (
-                    1 if len(group["adverse_events"]["other_events"]) > 0 else 0
-                )
-                parsed_cts_simple[result_type]["no_serious_events"] += (
-                    1 if len(group["adverse_events"]["serious_events"]) == 0 else 0
-                )
-                parsed_cts_simple[result_type]["no_other_events"] += (
-                    1 if len(group["adverse_events"]["other_events"]) == 0 else 0
-                )
-        else:
-            statistics[result_type] += 1
-
-    simple_preprocessing_monopharmacy = {
-        trial["nctid"]: trial
-        for trial in parsed_cts_simple["simple_fully_matched"]["trials"]
-    }
-
-    simple_preprocessing_monopharmacy_unique_group_code = []
-    for nctid, trial in simple_preprocessing_monopharmacy.items():
-        for study_group in trial["study_groups"]:
-            simple_preprocessing_monopharmacy_unique_group_code.append(
-                study_group["group_code"]
-            )
-
-    assert len(simple_preprocessing_monopharmacy_unique_group_code) == len(
-        list(set(simple_preprocessing_monopharmacy_unique_group_code))
-    )
-    print("For simple monopharmacy preprocessing:")
-    print("Unique nctids:", len(simple_preprocessing_monopharmacy))
-    print(
-        "Unique study groups:", len(simple_preprocessing_monopharmacy_unique_group_code)
-    )
-
-    ##### Group resolution monopharmacy pre-processing #####
-
-    # Initialize dictionary for storing statistics
-    statistics = {
-        "no_NCTID": 0,
-        "no_eligibilityCriteria": 0,
-        "no_ct_interventions": 0,
-        "no_ArmGroup_matched_to_interventions": 0,
-        "no_adverse_events": 0,
-        "no_matching_arm_group_at_all": 0,
-    }
-
-    # Initialize dictionary for storing parsed clinical trials data
-    parsed_cts_group_resolution = {
-        "fully_matched": {
-            "trials": [],
-            "serious_events": 0,
-            "other_events": 0,
-            "no_serious_events": 0,
-            "no_other_events": 0,
-        },
-        "partially_matched": {
-            "trials": [],
-            "serious_events": 0,
-            "other_events": 0,
-            "no_serious_events": 0,
-            "no_other_events": 0,
-        },
-    }
-
-    # Process each file using multiprocessing
-    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
-        results = list(
-            tqdm(
-                pool.imap(group_resolution_preprocessing, all_file_paths),
-                total=len(all_file_paths),
-            )
-        )
-
-    # Aggregate results from multiprocessing
-    for result in results:
-        result_type = result[0]
-        if result_type in ["fully_matched", "partially_matched"]:
-            # Append the clinical trial data
-            parsed_cts_group_resolution[result_type]["trials"].append(result[1])
-
-            # Count the serious and other events in the current trial
-            for group in result[1]["study_groups"]:
-                parsed_cts_group_resolution[result_type]["serious_events"] += (
-                    1 if len(group["adverse_events"]["serious_events"]) > 0 else 0
-                )
-                parsed_cts_group_resolution[result_type]["other_events"] += (
-                    1 if len(group["adverse_events"]["other_events"]) > 0 else 0
-                )
-                parsed_cts_group_resolution[result_type]["no_serious_events"] += (
-                    1 if len(group["adverse_events"]["serious_events"]) == 0 else 0
-                )
-                parsed_cts_group_resolution[result_type]["no_other_events"] += (
-                    1 if len(group["adverse_events"]["other_events"]) == 0 else 0
-                )
-        else:
-            statistics[result_type] += 1
-
-    fully_matched_group_resolution = parsed_cts_group_resolution["fully_matched"]
-    partially_matched_group_resolution = parsed_cts_group_resolution[
-        "partially_matched"
     ]
-
-    group_resolution_preprocessing_monopharmacy = {}
-
-    for trial in fully_matched_group_resolution["trials"]:
-        study_groups = trial["study_groups"]
-        for study_group in study_groups:
-            if is_monopharmacy_group_resolution(
-                study_group["intervention_details"]["name"]
-            ):
-                study_group["intervention_details"]["synonyms"] = (
-                    list(study_group["intervention_details"]["synonyms"][0].values())[0]
-                    if study_group["intervention_details"]["synonyms"]
-                    else []
-                )
-                if trial["nctid"] in group_resolution_preprocessing_monopharmacy:
-                    group_resolution_preprocessing_monopharmacy[trial["nctid"]][
-                        "study_groups"
-                    ].append(study_group)
-                else:
-                    group_resolution_preprocessing_monopharmacy[trial["nctid"]] = {
-                        "nctid": trial["nctid"],
-                        "title": trial["title"],
-                        "status": trial["status"],
-                        "sponsor": trial["sponsor"],
-                        "collaborators": trial["collaborators"],
-                        "healthy_volunteers": trial["healthy_volunteers"],
-                        "gender": trial["gender"],
-                        "age": trial["age"],
-                        "phase": trial["phase"],
-                        "enrollment_count": trial["enrollment_count"],
-                        "eligibility_criteria": trial["eligibility_criteria"],
-                        "study_groups": [],
-                    }
-                    group_resolution_preprocessing_monopharmacy[trial["nctid"]][
-                        "study_groups"
-                    ].append(study_group)
-
-    for trial in partially_matched_group_resolution["trials"]:
-        study_groups = trial["study_groups"]
-        for study_group in study_groups:
-            if is_monopharmacy_group_resolution(
-                study_group["intervention_details"]["name"]
-            ):
-                study_group["intervention_details"]["synonyms"] = (
-                    list(study_group["intervention_details"]["synonyms"][0].values())[0]
-                    if study_group["intervention_details"]["synonyms"]
-                    else []
-                )
-                if trial["nctid"] in group_resolution_preprocessing_monopharmacy:
-                    group_resolution_preprocessing_monopharmacy[trial["nctid"]][
-                        "study_groups"
-                    ].append(study_group)
-                else:
-                    group_resolution_preprocessing_monopharmacy[trial["nctid"]] = {
-                        "nctid": trial["nctid"],
-                        "title": trial["title"],
-                        "status": trial["status"],
-                        "sponsor": trial["sponsor"],
-                        "collaborators": trial["collaborators"],
-                        "healthy_volunteers": trial["healthy_volunteers"],
-                        "gender": trial["gender"],
-                        "age": trial["age"],
-                        "phase": trial["phase"],
-                        "enrollment_count": trial["enrollment_count"],
-                        "eligibility_criteria": trial["eligibility_criteria"],
-                        "study_groups": [],
-                    }
-                    group_resolution_preprocessing_monopharmacy[trial["nctid"]][
-                        "study_groups"
-                    ].append(study_group)
-
-    group_resolution_monopharmacy_unique_group_code = []
-    for nctid, trial in group_resolution_preprocessing_monopharmacy.items():
-        for study_group in trial["study_groups"]:
-            group_resolution_monopharmacy_unique_group_code.append(
-                study_group["group_code"]
+    if len(regular_matches) == 1:
+        return regular_matches[0]
+    if len(regular_matches) > 1:
+        strict_matches = [
+            event_group
+            for event_group in regular_matches
+            if has_strict_group_match(
+                result_values,
+                [event_group.get("title"), event_group.get("description")],
             )
+        ]
+        if len(strict_matches) == 1:
+            return strict_matches[0]
+    return None
 
-    assert len(group_resolution_monopharmacy_unique_group_code) == len(
-        list(set(group_resolution_monopharmacy_unique_group_code))
-    )
-    print("For group resolution monopharmacy preprocessing:")
-    print("Unique nctids:", len(group_resolution_preprocessing_monopharmacy))
-    print("Unique study groups:", len(group_resolution_monopharmacy_unique_group_code))
 
-    ##### Merging the two strategy outputs #####
+def match_result_to_event_groups(
+    result_groups: Sequence[Dict], event_groups: Sequence[Dict]
+) -> Tuple[List[Tuple[Dict, Dict]], int]:
+    """Match each participant-flow group using the original a2 rules."""
+    matches: List[Tuple[Dict, Dict]] = []
+    used_event_ids: Set[str] = set()
+    for result_group in result_groups:
+        available_event_groups = [
+            group for group in event_groups if group["id"] not in used_event_ids
+        ]
+        event_group = find_event_group_for_result_group(
+            result_group, available_event_groups
+        )
+        if event_group is not None:
+            matches.append((result_group, event_group))
+            used_event_ids.add(event_group["id"])
+    return matches, len(result_groups) - len(matches)
 
-    merged_preprocessing_monopharmacy = copy.deepcopy(simple_preprocessing_monopharmacy)
-    annomalies = []
-    for nctid, trial in group_resolution_preprocessing_monopharmacy.items():
-        if nctid in merged_preprocessing_monopharmacy:
-            study_groups = trial["study_groups"]
-            for study_group in study_groups:
-                if study_group["group_code"] not in [
-                    i["group_code"]
-                    for i in merged_preprocessing_monopharmacy[nctid]["study_groups"]
-                ]:
-                    # This should not happen. If it does, it's due to poorly annotated CTs. Currently, this is happening one time for a clinical trial
-                    # where the "armGroupLabels" have been reversed (see "NCT00679055").
-                    # This trial (NCTID) must be removed from the final result.
-                    # print(f"Annomaly found for {nctid} ({nctid} will be deleted from the final result).")
-                    annomalies.append(nctid)
-        else:
-            merged_preprocessing_monopharmacy[nctid] = trial
 
-    for annomaly in annomalies:
-        del merged_preprocessing_monopharmacy[annomaly]
+def process_study(path: Path) -> Tuple[str, Optional[Dict]]:
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            study = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return "invalid_json", None
 
-    merged_preprocessing_monopharmacy_unique_group_code = []
-    for nctid, trial in merged_preprocessing_monopharmacy.items():
-        for study_group in trial["study_groups"]:
-            merged_preprocessing_monopharmacy_unique_group_code.append(
-                study_group["group_code"]
+    nctid = get_nested(study, "protocolSection", "identificationModule", "nctId")
+    if not nctid:
+        return "no_NCTID", None
+    drugs = extract_active_drugs(study)
+    if len(drugs) < 2:
+        return "fewer_than_two_active_drugs", None
+    multi_drug_arms = find_protocol_multi_drug_arms(study, drugs)
+    if not multi_drug_arms:
+        return "no_multi_drug_protocol_arm", None
+    result_groups = extract_multi_drug_result_groups(study, drugs)
+    if not result_groups:
+        return "no_multi_drug_result_group", None
+    event_groups = extract_adverse_event_groups(study)
+    if not event_groups:
+        return "no_adverse_event_groups", None
+    matches, unmatched_count = match_result_to_event_groups(result_groups, event_groups)
+    if not matches:
+        return "no_adverse_event_group_match", None
+
+    drug_by_id = {drug["drug_id"]: drug for drug in drugs}
+    output = {"nctid": nctid, **get_trial_details(study), "study_groups": []}
+    for result_group, event_group in matches:
+        matched = [drug_by_id[drug_id] for drug_id in result_group["drug_ids"]]
+        output["study_groups"].append(
+            {
+                "group_code": f"{nctid}_{event_group['id']}",
+                "intervention_details": {
+                    "name": [f"Drug: {drug['name']}" for drug in matched],
+                    "synonyms": {drug["name"]: drug["aliases"] for drug in matched},
+                    "description": event_group.get("description"),
+                },
+                "adverse_events": {
+                    "serious_events": event_group["serious_events"],
+                    "other_events": event_group["other_events"],
+                },
+            }
+        )
+    status = "fully_matched" if unmatched_count == 0 else "partially_matched"
+    return status, output
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
+    parser.add_argument("--output-file", type=Path, default=DEFAULT_OUTPUT_FILE)
+    parser.add_argument("--workers", type=int, default=min(8, multiprocessing.cpu_count()))
+    return parser.parse_args()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    args = parse_args()
+    input_dir = args.input_dir.expanduser().resolve()
+    output_file = args.output_file.expanduser().resolve()
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
+    paths = sorted(input_dir.rglob("*.json"))
+    with multiprocessing.Pool(args.workers) as pool:
+        results = list(
+            tqdm(
+                pool.imap_unordered(process_study, paths, chunksize=50),
+                total=len(paths),
+                desc="Extracting multi-drug groups",
             )
-
-    assert len(merged_preprocessing_monopharmacy_unique_group_code) == len(
-        list(set(merged_preprocessing_monopharmacy_unique_group_code))
-    )
-    print("For simple + group resolution monopharmacy preprocessing:")
-    print("Unique nctids:", len(merged_preprocessing_monopharmacy))
-    print(
-        "Unique study groups:", len(merged_preprocessing_monopharmacy_unique_group_code)
-    )
-
-    file_path = OUTPUT_FILE
-    output_folder = file_path.parent
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    # Open the file in write mode
-    with open(file_path, "w") as file:
-        # Serialize dict to JSON formatted string and write to the file
-        json.dump(merged_preprocessing_monopharmacy, file, indent=4)
+        )
+    statistics = Counter(status for status, _ in results)
+    trials = {trial["nctid"]: trial for _, trial in results if trial is not None}
+    group_codes = [
+        group["group_code"]
+        for trial in trials.values()
+        for group in trial["study_groups"]
+    ]
+    if len(group_codes) != len(set(group_codes)):
+        raise RuntimeError("Duplicate adverse-event group_code found")
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("w", encoding="utf-8") as file:
+        json.dump(trials, file, ensure_ascii=False, indent=2)
+    logging.info("Statuses: %s", dict(sorted(statistics.items())))
+    logging.info("Wrote %d studies and %d groups to %s", len(trials), len(group_codes), output_file)
 
 
 if __name__ == "__main__":

@@ -758,3 +758,36 @@ Original processing log:
 2026-08-03 12:20:34,130 - INFO - Statuses: {'fewer_than_two_active_drugs': 52348, 'fully_matched': 7594, 'no_adverse_event_group_match': 1595, 'no_adverse_event_groups': 3, 'no_multi_drug_protocol_arm': 8854, 'no_multi_drug_result_group': 2583, 'partially_matched': 459}
 2026-08-03 12:20:34,130 - INFO - Wrote 8053 studies and 16585 groups to /srv/beegfs/scratch/users/h/hej/dataset/CT-ADE/preprocessed_multi_drug_cts.json
 ```
+
+---
+
+## 14. Chemical Database Mapping Result
+
+The multi-drug chemical database mapping step (`g0_create_ct_ade_raw.py`)
+produced the following result:
+
+| Metric | Count |
+|---|---:|
+| Total multi-drug study groups | 16,585 |
+| Successfully mapped study groups | 10,908 |
+| Unmapped study groups | 5,677 |
+| Unique mapped drugs | 1,921 |
+| Study-group mapping rate | 65.77% |
+
+A study group is counted as successfully mapped only when all drugs in its
+combination are mapped to the unified chemical database. Thus, 10,908 complete
+multi-drug combinations are currently available for downstream processing.
+
+Original processing log:
+
+```text
+Final Combined Results:
+Study groups mapped: 10908
+Unique drugs mapped: 1921
+
+Among the 16585 unique study groups, 10908 were mapped (65.77%)
+```
+
+The next pipeline step is MedDRA annotation with
+`g1_create_ct_ade_meddra.py`. This step is pending approval of MedDRA access
+and availability of the licensed English `MedAscii` release files.
