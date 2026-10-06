@@ -1,6 +1,6 @@
 # Generated and downloaded datasets
 data/**
-analysis/analysis/ct_ade_statistics/
+analysis/ct_ade_statistics/
 
 # Keep the repository's empty data-directory placeholders
 !data/**/
