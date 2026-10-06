@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import json
 from statsmodels.stats.proportion import proportion_confint
 from multiprocessing import Pool, cpu_count
 from tqdm.auto import tqdm
@@ -287,6 +288,39 @@ def split_dataframe_by_smiles(
     return train_df, val_df, test_df
 
 
+def extract_group_drug_fields(drugs_json: str) -> Dict[str, str]:
+    """Read all drugs in an arm without discarding combination components.
+
+    All four fields are JSON arrays in the same stable order. The serialized
+    SMILES array also serves as the split key, independent of source order.
+    """
+    try:
+        drugs = json.loads(drugs_json)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Drugs must contain a JSON array") from exc
+    if not isinstance(drugs, list) or not drugs:
+        raise ValueError("Drugs must contain a nonempty JSON array")
+    for drug in drugs:
+        if not isinstance(drug, dict) or not drug.get("smiles"):
+            raise ValueError("Every drug in Drugs must have a SMILES string")
+
+    ordered = sorted(drugs, key=lambda drug: (drug["smiles"], drug.get("canonical_name") or ""))
+    return {
+        "drug_info_source": json.dumps(
+            [drug.get("drug_info_source") for drug in ordered], ensure_ascii=False
+        ),
+        "canonical_name": json.dumps(
+            [drug.get("canonical_name") for drug in ordered], ensure_ascii=False
+        ),
+        "smiles": json.dumps(
+            [drug["smiles"] for drug in ordered], ensure_ascii=False
+        ),
+        "atc_code": json.dumps(
+            [drug.get("atc_code") for drug in ordered], ensure_ascii=False
+        ),
+    }
+
+
 def main() -> None:
     # Reason maps for rejections
     reason_map_event_type = {
@@ -332,6 +366,19 @@ def main() -> None:
             "ade_mapped_code_LLT": str,
         },
     )
+
+    # g0/g1 store arm-level drug details in the Drugs JSON column. Reuse one
+    # parsed record per distinct JSON value across the many adverse-event rows.
+    drug_fields = {
+        value: extract_group_drug_fields(value)
+        for value in ct_ade_meddra["Drugs"].dropna().unique()
+    }
+    if ct_ade_meddra["Drugs"].isna().any():
+        raise ValueError("Drugs is missing in one or more input rows")
+    for field in ("drug_info_source", "canonical_name", "smiles", "atc_code"):
+        ct_ade_meddra[field] = ct_ade_meddra["Drugs"].map(
+            lambda value: drug_fields[value][field]
+        )
 
     meddra = MedDRA()
     meddra.load_data("./data/MedDRA_25_0_English/MedAscii")

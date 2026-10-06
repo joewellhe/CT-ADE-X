@@ -9,7 +9,7 @@ from copy import deepcopy
 from collections import Counter
 import logging
 import pandas as pd
-from typing import Optional, Dict, Any, Set, List, Tuple, Iterator, TypeVar, Callable
+from typing import Optional, Dict, Any, Set, List, Tuple, Iterator, TypeVar, Callable, Union
 
 T = TypeVar("T")
 stop_words = set(stopwords.words("english"))
@@ -147,17 +147,70 @@ def sanitize_drug_name(drug: str) -> str:
     return drug
 
 
-def normalize_synonyms(synonyms: Set[str], sanitize: bool = False) -> Set[str]:
+def sanitize_drug_name_tokens(drug: str) -> str:
+    """Remove standalone separators and dose tokens without altering drug names.
+
+    Unlike ``sanitize_drug_name``, punctuation inside a token (for example
+    ``ABT-888`` or ``amoxicillin/clavulanate``) is preserved.
+    """
+    units = r"(?:mg|mcg|µg|ug|g|ml|iu|mmol|nmol|pmol|kg)"
+    amount = rf"\d+(?:\.\d+)?(?:{units}|%)"
+    dose_token = rf"{amount}(?:[-/]{amount})*(?:/(?:m2|m²|kg|day|ml))?"
+    unit_token = rf"{units}(?:/(?:m2|m²|kg|day|ml))?"
+    removable_words = {
+        "oral", "injection", "intravenous", "topical", "nasal",
+        "subcutaneous", "intramuscular", "inhalation", "rectal",
+        "sublingual", "transdermal", "intradermal", "ophthalmic",
+        "otic", "vaginal", "buccal", "enteral", "parenteral",
+        "intravitreal", "tablet", "capsule", "cream", "ointment",
+        "gel", "solution", "suspension", "syrup", "lozenge",
+        "patch", "powder", "aerosol", "emulsion", "spray", "drop",
+        "film", "foam", "implant", "inhaler", "insert", "lotion",
+        "pessary", "suppository",
+    }
+    tokens = drug.lower().split()
+    kept = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        # Split combination doses may span three tokens: "500 mg-125 mg".
+        if (regex.fullmatch(r"\d+(?:\.\d+)?", token)
+                and index + 2 < len(tokens)
+                and regex.fullmatch(rf"{units}-\d+(?:\.\d+)?", tokens[index + 1])
+                and regex.fullmatch(unit_token, tokens[index + 2])):
+            index += 3
+            continue
+        # A separate number and unit form one dose, e.g. "50 mg".
+        if (regex.fullmatch(r"\d+(?:\.\d+)?", token)
+                and index + 1 < len(tokens)
+                and regex.fullmatch(unit_token, tokens[index + 1])):
+            index += 2
+            continue
+        if (regex.fullmatch(dose_token, token)
+                or regex.fullmatch(r"\d+(?:\.\d+)?%", token)
+                or regex.fullmatch(r"[^\p{L}\p{N}]+", token)
+                or token in removable_words):
+            index += 1
+            continue
+        kept.append(token)
+        index += 1
+    return " ".join(kept)
+
+
+def normalize_synonyms(synonyms: Set[str], sanitize: Union[bool, str] = False) -> Set[str]:
     """
     Normalizes a set of drug synonyms by optionally sanitizing them and converting to lowercase.
 
     Args:
         synonyms (Set[str]): A set of synonyms to normalize.
-        sanitize (bool): Whether to sanitize the synonyms. Defaults to False.
+        sanitize (bool or str): True for the original cleanup, "tokens" for
+            whitespace-token cleanup, or False. Defaults to False.
 
     Returns:
         Set[str]: A set of normalized synonyms.
     """
+    if sanitize == "tokens":
+        return {sanitize_drug_name_tokens(synonym) for synonym in synonyms}
     if sanitize:
         return {sanitize_drug_name(synonym).lower().strip() for synonym in synonyms}
     else:
@@ -316,11 +369,44 @@ def chunk_dict(data: Dict[str, T], num_chunks: int) -> Iterator[Dict[str, T]]:
         }
 
 
+def is_mapped_multi_drug_group(drugs: List[Dict[str, Any]]) -> bool:
+    """Require complete mappings and at least two distinct drug IDs per group."""
+    if len(drugs) < 2 or not all(
+        drug.get("smiles") and drug.get("drug_id") for drug in drugs
+    ):
+        return False
+    return len({drug["drug_id"] for drug in drugs}) >= 2
+
+
+def merge_mapped_drugs_by_id(drugs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge mapped entries by ID in first-seen order without changing the input.
+
+    Keep the first entry's name and standardized fields. For duplicate IDs,
+    combine synonyms and retain source names in ``original_names``.
+    """
+    merged_drugs = {}
+    for drug in drugs:
+        drug_id = drug["drug_id"]
+        if drug_id not in merged_drugs:
+            merged_drugs[drug_id] = deepcopy(drug)
+            continue
+
+        merged = merged_drugs[drug_id]
+        merged["original_names"] = list(dict.fromkeys(
+            merged.get("original_names", [merged["name"]])
+            + drug.get("original_names", [drug["name"]])
+        ))
+        merged["synonyms"] = list(dict.fromkeys(
+            merged.get("synonyms", []) + drug.get("synonyms", [])
+        ))
+    return list(merged_drugs.values())
+
+
 def process_trial_group(
     candidate_data: Tuple[List[str], List[Set[str]], List[str], List[str], List[str]],
     trial_chunk: Dict[str, Any],
     match_function: Callable[[Set[str], Set[str]], Any],
-    sanitize: bool,
+    sanitize: Union[bool, str],
 ) -> Tuple[Dict[str, Any], Set[str], Set[str]]:
     """
     Processes a chunk of trial data to map drug IDs to intervention details using predefined synonyms, titles, ATC codes, and sources.
@@ -394,7 +480,7 @@ def process_trial_group(
                             break
 
             drugs = intervention_details["drugs"]
-            if len(drugs) >= 2 and all("smiles" in drug for drug in drugs):
+            if is_mapped_multi_drug_group(drugs):
                 mapped_study_group_codes.add(study_group["group_code"])
         modified_trial_data[nctid] = trial
 
@@ -405,7 +491,7 @@ def process_matching_multiprocessing(
     trial_data: Dict[str, Any],
     drug_id_details: Dict[str, Any],
     match_function: Callable[[Set[str], Set[str]], Optional[str]],
-    sanitize: bool = False,
+    sanitize: Union[bool, str] = False,
     num_processes: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Set[str], Set[str]]:
     """
@@ -494,7 +580,7 @@ def collect_mapped_study_groups(
     preprocessed_trials: Dict[str, Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """
-    Collects and combines data from trials and their study groups where study groups have been mapped.
+    Collects fully mapped multi-drug groups with one entry per distinct drug ID.
 
     Args:
         preprocessed_trials (Dict[str, Dict[str, Any]]): preprocessed trials from `process_matching_multiprocessing` output.
@@ -506,7 +592,7 @@ def collect_mapped_study_groups(
     for nct_id, trial in preprocessed_trials.items():
         for study_group in trial["study_groups"]:
             drugs = study_group["intervention_details"].get("drugs", [])
-            if len(drugs) >= 2 and all("smiles" in drug for drug in drugs):
+            if is_mapped_multi_drug_group(drugs):
                 combined_data = {
                     "nctid": trial["nctid"],
                     "title": trial["title"],
@@ -520,6 +606,10 @@ def collect_mapped_study_groups(
                     "enrollment_count": trial["enrollment_count"],
                     "eligibility_criteria": trial["eligibility_criteria"],
                     **study_group,
+                    "intervention_details": {
+                        **study_group["intervention_details"],
+                        "drugs": merge_mapped_drugs_by_id(drugs),
+                    },
                 }
                 mapped_study_groups.append(combined_data)
     return mapped_study_groups
@@ -656,7 +746,7 @@ def main() -> None:
     """
     # Load data from JSON files
     preprocessed_multi_drug_cts_mapped = read_json_file(
-        "./data/clinicaltrials_gov/preprocessed_multi_drug_cts.json"
+        "./data/clinicaltrials_gov/verified_multi_drug_cts.json"
     )
     loaded_compound_details = read_json_file(
         "./data/unified_chemical_database/unified_chemical_database.json"
@@ -725,6 +815,21 @@ def main() -> None:
     )
     all_mapped_codes.update(codes_pre_partial)
     all_unique_smiles.update(smiles_pre_partial)
+
+    # Conservative cleanup of whitespace-separated dose and punctuation tokens.
+    # Run last so existing mappings keep their original selected compound.
+    (
+        preprocessed_multi_drug_cts_mapped,
+        codes_token_exact,
+        smiles_token_exact,
+    ) = process_matching_multiprocessing(
+        preprocessed_multi_drug_cts_mapped,
+        loaded_compound_details,
+        find_exact_match,
+        sanitize="tokens",
+    )
+    all_mapped_codes.update(codes_token_exact)
+    all_unique_smiles.update(smiles_token_exact)
 
     # Print the final combined summary
     print_summary("Final Combined Results", all_mapped_codes, all_unique_smiles)

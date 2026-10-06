@@ -18,3 +18,4 @@ tensorboard==2.16.2
 trl==0.8.7.dev0
 wget==3.2
 flash_attn==2.5.9.post1
+openai>=1.68.0

@@ -1,9 +1,11 @@
-"""Extract multi-drug result groups and their adverse events.
+"""Extract multi-drug result groups supported by complete protocol arms.
 
-The script uses participant-flow groups as the source of result groups.  A
-study must first have a protocol arm explicitly associated with at least two
-active DRUG interventions.  A participant-flow group is retained only when
-its title and description identify at least two distinct active drugs.
+Build a trial-wide intervention index, resolve each protocol arm's references,
+and exclude the trial if an arm references a non-placebo non-DRUG intervention.
+Only complete arms with at least two distinct drugs are eligible. Every drug
+of the selected arm must match the participant-flow group's title+description,
+using primary names, cleaned aliases, then bounded normalized-name candidates.
+Unresolved arm references and ambiguous result-to-arm mappings are not accepted.
 """
 
 import argparse
@@ -22,10 +24,111 @@ DEFAULT_INPUT_DIR = Path(
     "~/scratch/dataset/CT-ADE/completed_or_terminated_interventional_results_cts"
 ).expanduser()
 DEFAULT_OUTPUT_FILE = Path(
-    "~/scratch/dataset/CT-ADE/preprocessed_multi_drug_cts.json"
+    "data/clinicaltrials_gov/preprocessed_multi_drug_cts.json"
 ).expanduser()
 
 PLACEBO_RE = re.compile(r"\b(placebo|sham|dummy)\b", re.IGNORECASE)
+
+# Terminal candidate-name modifiers, NOT pharmaceutical equivalence rules.
+# Never remove these words from inside a drug name.
+CHEMICAL_FORM_SUFFIXES = (
+    "hydrochloride", "dihydrochloride", "trihydrochloride", "hcl",
+    "hydrobromide", "bromide", "chloride", "iodide",
+    "phosphate", "diphosphate", "sulfate", "sulphate", "bisulfate",
+    "acetate", "citrate", "tartrate", "bitartrate", "maleate", "fumarate",
+    "mesylate", "mesilate", "besylate", "besilate", "tosylate", "ditosylate",
+    "succinate", "oxalate", "lactate", "gluconate", "pamoate", "nitrate",
+    "sodium", "disodium", "potassium", "calcium", "magnesium",
+    "hydrate", "monohydrate", "dihydrate", "trihydrate", "hemihydrate",
+)
+CHEMICAL_FORM_SUFFIX_RE = re.compile(
+    r"\s+(?:" + "|".join(map(re.escape, CHEMICAL_FORM_SUFFIXES)) + r")$",
+    re.IGNORECASE,
+)
+PARENTHETICAL_RE = re.compile(r"\(([^()]*)\)|\[([^\[\]]*)\]")
+NUMBER_PATTERN = r"(?:\d+(?:\.\d+)?|\.\d+)"
+DOSE_RE = re.compile(
+    rf"(?<![\w.-]){NUMBER_PATTERN}"
+    rf"(?:\s*[-–—]\s*{NUMBER_PATTERN})?\s*"
+    r"(?:mcg|[µμu]g|mg|ng|pg|kg|g|ml|l|iu|i\.u\.|units?|%)"
+    r"(?![\w])"
+    r"(?:\s*/\s*(?:kg|m\s*(?:\^\s*)?2|ml|l|day|d|h|hr|min)\b)*",
+    re.IGNORECASE,
+)
+NON_ALIAS_ANNOTATIONS = {
+    "iv", "im", "sc", "sq", "po", "oral", "topical", "bid", "tid", "qd",
+    "xr", "er", "sr", "ir", "cr", "dr", "xl", "la", "pr",
+    "mg", "mcg", "ml", "iu", "tablet", "tablets", "capsule", "capsules",
+    "extended release", "immediate release", "sustained release",
+    *CHEMICAL_FORM_SUFFIXES,
+}
+
+
+def generate_drug_name_candidates(name: str) -> List[str]:
+    """Generate normalized fallback aliases without inventing abbreviations.
+
+    Compose bracket splitting, explicit dose removal and trailing chemical-form
+    removal. Keep the original alias too. These candidates establish possible
+    name mentions, not active administration, dose or formulation equivalence.
+    """
+    raw = unicodedata.normalize(
+        "NFKC", str(name or "").replace("®", "").replace("™", "")
+    )
+    raw = re.sub(r"^\s*Drug\s*:\s*", "", raw, flags=re.IGNORECASE).strip()
+    if not raw or is_placebo(raw):
+        return []
+    pending = [raw]
+    seen_raw: Set[str] = set()
+    candidates: List[str] = []
+    seen_candidates: Set[str] = set()
+    while pending:
+        value = pending.pop(0).strip()
+        if not value or value in seen_raw:
+            continue
+        seen_raw.add(value)
+        key = normalize_text(value)
+        if (
+            len(key) >= 2 and re.search(r"[^\W\d_]", key, re.UNICODE)
+            and key not in NON_ALIAS_ANNOTATIONS and not is_placebo(value)
+            and DOSE_RE.fullmatch(value.strip("()[] \t")) is None
+            and key not in seen_candidates
+        ):
+            candidates.append(key)
+            seen_candidates.add(key)
+        brackets = list(PARENTHETICAL_RE.finditer(value))
+        if brackets:
+            pending.append(PARENTHETICAL_RE.sub(" ", value))
+            for match in brackets:
+                for part in re.split(r"[,;]", match.group(1) or match.group(2) or ""):
+                    # Keep supplied aliases; do not split combination ingredients.
+                    if not DOSE_RE.search(part):
+                        pending.append(part)
+        without_dose = DOSE_RE.sub(" ", value)
+        if without_dose != value:
+            pending.append(without_dose)
+        without_suffix = CHEMICAL_FORM_SUFFIX_RE.sub("", key)
+        if without_suffix != key:
+            pending.append(without_suffix)
+    return candidates
+
+
+def build_fallback_aliases(drugs: Sequence[Dict]) -> Dict[int, List[str]]:
+    """Apply the existing shared-alias ambiguity rule to generated candidates."""
+    candidates: Dict[int, List[str]] = {}
+    owners: Dict[str, Set[int]] = {}
+    for drug in drugs:
+        drug_id = drug["drug_id"]
+        candidates[drug_id] = list(dict.fromkeys(
+            candidate for alias in [drug["name"], *drug["aliases"]]
+            for candidate in generate_drug_name_candidates(alias)
+        ))
+        for candidate in candidates[drug_id]:
+            owners.setdefault(candidate, set()).add(drug_id)
+        owners.setdefault(normalize_text(drug["name"]), set()).add(drug_id)
+    return {
+        drug_id: [alias for alias in aliases if len(owners[alias]) == 1]
+        for drug_id, aliases in candidates.items()
+    }
 def normalize_text(value: Any) -> str:
     """Normalize text while retaining token boundaries for safe matching."""
     text = unicodedata.normalize("NFKC", str(value or "")).casefold()
@@ -90,8 +193,8 @@ def get_trial_details(study: Dict) -> Dict[str, Any]:
     }
 
 
-def extract_active_drugs(study: Dict) -> List[Dict[str, Any]]:
-    """Extract distinct active DRUG records and unambiguous aliases."""
+def extract_non_placebo_interventions(study: Dict) -> List[Dict[str, Any]]:
+    """Exclude empty names and placebo/sham/dummy before checking types."""
     interventions = get_nested(
         study,
         "protocolSection",
@@ -99,16 +202,25 @@ def extract_active_drugs(study: Dict) -> List[Dict[str, Any]]:
         "interventions",
         default=[],
     )
-    drugs: List[Dict[str, Any]] = []
-    seen_names: Set[str] = set()
+    retained = []
     for intervention in interventions if isinstance(interventions, list) else []:
         if not isinstance(intervention, dict):
             continue
         name = str(intervention.get("name") or "").strip()
-        if str(intervention.get("type") or "").casefold() != "drug":
-            continue
         if not name or is_placebo(name):
             continue
+        retained.append(intervention)
+    return retained
+
+
+def extract_active_drugs(study: Dict) -> List[Dict[str, Any]]:
+    """Extract distinct active DRUG records and unambiguous aliases."""
+    drugs: List[Dict[str, Any]] = []
+    seen_names: Set[str] = set()
+    for intervention in extract_non_placebo_interventions(study):
+        if str(intervention.get("type") or "").strip().casefold() != "drug":
+            continue
+        name = str(intervention.get("name") or "").strip()
         key = normalize_text(name)
         if not key or key in seen_names:
             continue
@@ -160,31 +272,115 @@ def resolve_drug_reference(reference: str, drugs: Sequence[Dict]) -> Optional[in
     return matches[0] if len(matches) == 1 else None
 
 
-def find_protocol_multi_drug_arms(study: Dict, drugs: Sequence[Dict]) -> List[Dict]:
-    """Step 1: find arms explicitly linked to at least two active drugs."""
-    arms = get_nested(
-        study, "protocolSection", "armsInterventionsModule", "armGroups", default=[]
-    )
-    selected = []
-    for arm in arms if isinstance(arms, list) else []:
+def build_intervention_index(study: Dict) -> List[Dict]:
+    """Index all trial interventions, merging duplicate normalized type/name pairs."""
+    raw = get_nested(study, "protocolSection", "armsInterventionsModule",
+                     "interventions", default=[])
+    records: List[Dict] = []
+    by_key: Dict[Tuple[str, str], Dict] = {}
+    for source_index, item in enumerate(raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        kind = str(item.get("type") or "").strip().upper()
+        key = (kind, normalize_text(name))
+        if key not in by_key:
+            record = {
+                "intervention_id": len(records), "name": name, "type": kind,
+                "otherNames": [], "source_indexes": [],
+            }
+            by_key[key] = record
+            records.append(record)
+        record = by_key[key]
+        record["source_indexes"].append(source_index)
+        aliases = item.get("otherNames") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        for alias in aliases if isinstance(aliases, list) else []:
+            if isinstance(alias, str) and alias.strip() not in record["otherNames"]:
+                if alias.strip():
+                    record["otherNames"].append(alias.strip())
+    return records
+
+
+def resolve_intervention_reference(reference: str, index: Sequence[Dict]) -> Optional[int]:
+    """Resolve an arm link exactly, preferring canonical names over otherNames.
+
+    Preserve type prefixes when supplied; never fuzzy-match protocol links.
+    """
+    text = str(reference or "").strip()
+    prefix, separator, remainder = text.partition(":")
+    known_types = {r["type"].casefold() for r in index} | {
+        "drug", "biological", "device", "procedure", "radiation", "behavioral",
+        "dietary supplement", "genetic", "combination product", "diagnostic test", "other",
+    }
+    kind = prefix.strip().casefold() if separator and prefix.strip().casefold() in known_types else None
+    key = normalize_text(remainder if kind is not None else text)
+    if not key:
+        return None
+    pool = [r for r in index if kind is None or r["type"].casefold() == kind]
+    for primary in (True, False):
+        matches = [r["intervention_id"] for r in pool if key in {
+            normalize_text(a) for a in ([r["name"]] if primary else r["otherNames"])
+        }]
+        if matches:
+            return matches[0] if len(matches) == 1 else None
+    return None
+
+
+def link_protocol_arms(study: Dict, index: Sequence[Dict]) -> Tuple[List[Dict], bool]:
+    """Resolve every nonempty/non-placebo arm reference; detect trial exclusions.
+
+    An unresolved reference invalidates its arm rather than silently dropping a
+    potentially required drug. A resolved non-DRUG excludes the entire trial,
+    including when it occurs in a single-drug or otherwise incomplete arm.
+    """
+    raw = get_nested(study, "protocolSection", "armsInterventionsModule", "armGroups", default=[])
+    by_id = {r["intervention_id"]: r for r in index}
+    linked = []
+    has_non_drug = False
+    for arm_id, arm in enumerate(raw if isinstance(raw, list) else []):
         if not isinstance(arm, dict):
             continue
-        drug_ids = {
-            resolved
-            for reference in arm.get("interventionNames", [])
-            if not is_placebo(reference)
-            for resolved in [resolve_drug_reference(reference, drugs)]
-            if resolved is not None
-        }
-        if len(drug_ids) >= 2:
-            selected.append(
-                {
-                    "label": arm.get("label"),
-                    "description": arm.get("description"),
-                    "drug_ids": sorted(drug_ids),
-                }
-            )
-    return selected
+        ids: Set[int] = set()
+        unresolved = []
+        refs = arm.get("interventionNames") or []
+        if not isinstance(refs, list):
+            refs = [refs]
+        for reference in refs:
+            text = str(reference or "").strip()
+            if not text or is_placebo(text):
+                continue
+            # Also ignore an empty typed reference such as "Drug:".
+            if ":" in text and not text.partition(":")[2].strip():
+                continue
+            resolved = resolve_intervention_reference(text, index)
+            if resolved is None:
+                unresolved.append(text)
+                continue
+            record = by_id[resolved]
+            if not record["name"] or is_placebo(record["name"]):
+                continue
+            if record["type"] != "DRUG":
+                has_non_drug = True
+            ids.add(resolved)
+        linked.append({
+            "arm_id": arm_id, "label": arm.get("label"),
+            "description": arm.get("description"),
+            "intervention_ids": sorted(ids), "unresolved_references": unresolved,
+        })
+    return linked, has_non_drug
+
+
+def find_protocol_multi_drug_arms(linked_arms: Sequence[Dict], drugs: Sequence[Dict]) -> List[Dict]:
+    drug_ids = {d["intervention_id"]: d["drug_id"] for d in drugs}
+    return [
+        {**arm, "drug_ids": sorted({drug_ids[i] for i in arm["intervention_ids"]})}
+        for arm in linked_arms
+        if not arm["unresolved_references"]
+        and len(arm["intervention_ids"]) >= 2
+        and all(i in drug_ids for i in arm["intervention_ids"])
+    ]
 
 
 def matched_drugs(text: str, drugs: Sequence[Dict], use_synonyms: bool) -> Set[int]:
@@ -196,11 +392,18 @@ def matched_drugs(text: str, drugs: Sequence[Dict], use_synonyms: bool) -> Set[i
     return matches
 
 
-def extract_multi_drug_result_groups(study: Dict, drugs: Sequence[Dict]) -> List[Dict]:
-    """Step 2: retain participant-flow groups naming two or more drugs."""
-    groups = get_nested(
-        study, "resultsSection", "participantFlowModule", "groups", default=[]
-    )
+def extract_multi_drug_result_groups(
+    study: Dict, drugs: Sequence[Dict], arms: Sequence[Dict]
+) -> List[Dict]:
+    """Require every drug in one protocol arm, not merely any two trial drugs.
+
+    An exact result-title/arm-label match scopes the search before coverage is
+    tested. Otherwise require a unique fully covered arm. Multiple covered arms
+    are rejected rather than combining their drugs or choosing a subset at random.
+    """
+    groups = get_nested(study, "resultsSection", "participantFlowModule", "groups", default=[])
+    fallback_aliases = build_fallback_aliases(drugs)  # Trial-wide ambiguity filter.
+    by_id = {d["drug_id"]: d for d in drugs}
     selected = []
     for group in groups if isinstance(groups, list) else []:
         if not isinstance(group, dict):
@@ -208,22 +411,40 @@ def extract_multi_drug_result_groups(study: Dict, drugs: Sequence[Dict]) -> List
         title = str(group.get("title") or "")
         description = str(group.get("description") or "")
         text = f"{title} {description}"
-        direct = matched_drugs(text, drugs, use_synonyms=False)
-        match_method = "name"
-        drug_ids = direct
-        if len(drug_ids) < 2:
-            drug_ids = matched_drugs(text, drugs, use_synonyms=True)
-            match_method = "name_or_synonym"
-        if len(drug_ids) >= 2:
-            selected.append(
-                {
-                    "id": group.get("id"),
-                    "title": group.get("title"),
-                    "description": group.get("description"),
-                    "drug_ids": sorted(drug_ids),
-                    "drug_match_method": match_method,
-                }
-            )
+        # Include ineligible linked arms here to prevent a named single-drug or
+        # unresolved arm from being reassigned to another fully covered arm.
+        named = [a for a in arms if normalize_text(title)
+                 and normalize_text(a.get("label")) == normalize_text(title)]
+        candidates = named if named else arms
+        covered = []
+        for arm in candidates:
+            required = arm.get("drug_ids", [])
+            if len(required) < 2 or arm.get("unresolved_references"):
+                continue
+            arm_drugs = [by_id[i] for i in required]
+            direct = matched_drugs(text, arm_drugs, use_synonyms=False)
+            known = direct | matched_drugs(text, arm_drugs, use_synonyms=True)
+            matched = set(known)
+            for drug_id in required:
+                if drug_id not in matched and any(
+                    contains_alias(text, alias) for alias in fallback_aliases[drug_id]
+                ):
+                    matched.add(drug_id)
+            if not set(required).issubset(matched):
+                continue
+            method = ("name_or_synonym_or_normalized" if matched != known else
+                      "name_or_synonym" if known != direct else "name")
+            covered.append((arm, method))
+        if len(covered) != 1:
+            continue
+        arm, method = covered[0]
+        selected.append({
+            "id": group.get("id"), "title": group.get("title"),
+            "description": group.get("description"), "drug_ids": arm["drug_ids"],
+            "drug_match_method": method,
+            "protocol_arm_id": arm["arm_id"], "protocol_arm_label": arm["label"],
+            "intervention_ids": arm["intervention_ids"],
+        })
     return selected
 
 
@@ -357,13 +578,26 @@ def process_study(path: Path) -> Tuple[str, Optional[Dict]]:
     nctid = get_nested(study, "protocolSection", "identificationModule", "nctId")
     if not nctid:
         return "no_NCTID", None
-    drugs = extract_active_drugs(study)
+    intervention_index = build_intervention_index(study)
+    linked_arms, has_non_drug = link_protocol_arms(study, intervention_index)
+    if has_non_drug:
+        return "non_drug_interventions", None
+    # Reuse existing drug extraction/alias cleaning on deduplicated records.
+    drugs = extract_active_drugs({"protocolSection": {"armsInterventionsModule": {
+        "interventions": intervention_index,
+    }}})
+    indexed_drugs = {normalize_text(r["name"]): r["intervention_id"]
+                     for r in intervention_index if r["type"] == "DRUG"}
+    for drug in drugs:
+        drug["intervention_id"] = indexed_drugs[normalize_text(drug["name"])]
     if len(drugs) < 2:
         return "fewer_than_two_active_drugs", None
-    multi_drug_arms = find_protocol_multi_drug_arms(study, drugs)
+    multi_drug_arms = find_protocol_multi_drug_arms(linked_arms, drugs)
     if not multi_drug_arms:
         return "no_multi_drug_protocol_arm", None
-    result_groups = extract_multi_drug_result_groups(study, drugs)
+    eligible = {a["arm_id"]: a for a in multi_drug_arms}
+    matching_arms = [eligible.get(a["arm_id"], a) for a in linked_arms]
+    result_groups = extract_multi_drug_result_groups(study, drugs, matching_arms)
     if not result_groups:
         return "no_multi_drug_result_group", None
     event_groups = extract_adverse_event_groups(study)
@@ -374,12 +608,24 @@ def process_study(path: Path) -> Tuple[str, Optional[Dict]]:
         return "no_adverse_event_group_match", None
 
     drug_by_id = {drug["drug_id"]: drug for drug in drugs}
-    output = {"nctid": nctid, **get_trial_details(study), "study_groups": []}
+    output = {
+        "nctid": nctid, **get_trial_details(study),
+        "intervention_index": intervention_index, "protocol_arms": linked_arms,
+        "study_groups": [],
+    }
     for result_group, event_group in matches:
         matched = [drug_by_id[drug_id] for drug_id in result_group["drug_ids"]]
         output["study_groups"].append(
             {
                 "group_code": f"{nctid}_{event_group['id']}",
+                "protocol_arm_id": result_group["protocol_arm_id"],
+                "protocol_arm_label": result_group["protocol_arm_label"],
+                "intervention_ids": result_group["intervention_ids"],
+                "drug_match_method": result_group["drug_match_method"],
+                "drug_match_source": {
+                    "title": result_group["title"],
+                    "description": result_group["description"],
+                },
                 "intervention_details": {
                     "name": [f"Drug: {drug['name']}" for drug in matched],
                     "synonyms": {drug["name"]: drug["aliases"] for drug in matched},

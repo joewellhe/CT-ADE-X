@@ -83,9 +83,9 @@ def fetch_title(cid: str, retries: int = 5, delay: int = 2) -> Optional[str]:
     return None
 
 
-def fetch_canonical_smiles(cid: str, retries: int = 5, delay: int = 2) -> Optional[str]:
+def fetch_smiles(cid: str, retries: int = 5, delay: int = 2) -> Optional[str]:
     """
-    Fetch Canonical SMILES for a given Compound ID (CID) from PubChem.
+    Fetch SMILES retaining stereochemical information for a PubChem CID.
 
     Args:
         cid (str): Compound ID.
@@ -93,24 +93,22 @@ def fetch_canonical_smiles(cid: str, retries: int = 5, delay: int = 2) -> Option
         delay (int): Delay between retries in seconds. Default is 2.
 
     Returns:
-        str: Canonical SMILES if successful, None otherwise.
+        str: SMILES if successful, None otherwise.
     """
-    url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/CanonicalSMILES/JSON"
+    url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/SMILES/JSON"
     for attempt in range(retries):
         try:
             response = requests.get(url, timeout=(10, 60))
             response.raise_for_status()
             properties = response.json()["PropertyTable"]["Properties"][0]
-            # PubChem currently returns ConnectivitySMILES for this endpoint.
-            # Keep CanonicalSMILES as a fallback for older responses.
-            return properties.get("ConnectivitySMILES") or properties.get(
-                "CanonicalSMILES"
-            )
+            # Do not fall back to connectivity-only representations: they can
+            # cause distinct stereoisomers to merge in the unified database.
+            return properties.get("SMILES")
         except (requests.exceptions.RequestException, KeyError) as e:
             logging.error(f"Error on attempt {attempt + 1} for CID {cid}: {str(e)}")
             time.sleep(delay)
     logging.error(
-        f"Failed to fetch Canonical SMILES for CID {cid} after {retries} attempts."
+        f"Failed to fetch SMILES for CID {cid} after {retries} attempts."
     )
     return None
 
@@ -188,7 +186,7 @@ def main() -> None:
     for cid in cids:
         try:
             cid_info: Dict[str, Optional[str]] = {}
-            smiles = fetch_canonical_smiles(cid)
+            smiles = fetch_smiles(cid)
             if not smiles:
                 continue
             cid_info["title"] = fetch_title(cid)
