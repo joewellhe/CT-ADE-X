@@ -3,13 +3,13 @@ CT-ADE-X: An Expanded [CT-ADE](https://github.com/ds4dh/CT-ADE.git) Benchmark fo
 
 ------
 
-CT-ADE-X extends the original CT-ADE benchmark in follows 4 aspects: 
+CT-ADE-X extends the original CT-ADE benchmark in four ways:
 
-(1) Whereas CT-ADE focuses on single-drug interventions, CT-ADE-X additionally incorporates clinical trial arms involving multiple drugs ($n>1$), supporting ADE prediction for both individual drugs and drug combinations. 
+(1) Whereas CT-ADE focuses on single-drug interventions, CT-ADE-X additionally incorporates clinical trial arms involving multiple drugs ($n>1$), supporting ADE prediction for both individual drugs and drug combinations.
 
-(2) Second, we refine the dataset by excluding predefined MedDRA preferred terms outside the intended scope of drug-reaction prediction, including selected terms related to medication-use issues, device problems, and external exposures. 
+(2) Second, we refine the dataset by excluding predefined MedDRA preferred terms outside the intended scope of drug-reaction prediction, including selected terms related to medication-use issues, device problems, and external exposures.
 
-(3) Third, inspired by the EMA’s [*Screening for adverse reactions in EudraVigilance*](https://www.ema.europa.eu/en/documents/other/screening-adverse-reactions-eudravigilance_en.pdf), we adapt reporting odds ratio (ROR) analysis to clinical trial groups and combine it with the existing Wilson criterion. Positive labels require a Wilson lower bound of at least 1%, an ROR greater than 2, a 95% ROR confidence interval lower bound greater than 1, and at least five reporting groups, thereby incorporating evidence of disproportionate reporting relative to other drug regimens. 
+(3) Third, inspired by the EMA’s [*Screening for adverse reactions in EudraVigilance*](https://www.ema.europa.eu/en/documents/other/screening-adverse-reactions-eudravigilance_en.pdf), we adapt reporting odds ratio (ROR) analysis to clinical trial groups and combine it with the existing Wilson criterion. Positive labels require a Wilson lower bound of at least 1%, an ROR greater than 2, a 95% ROR confidence interval lower bound greater than 1, and at least five reporting groups, thereby incorporating evidence of disproportionate reporting relative to other drug regimens.
 
 (4) Finally, we introduce **CT-ADE-CS (Candidate Combination-Specific Adverse Drug Events)**, a subset retaining positive combination–ADE pairs for which no nonempty proper drug subset exhibits the same positive signal in the available data, supporting investigation of potentially combination-specific safety signals.
 
@@ -37,23 +37,26 @@ To focus the benchmark on drug-reaction prediction, we exclude records mapped to
 
 ### Positive Criteria Modification
 
-Inspired by the EMA’s [*Screening for adverse reactions in EudraVigilance*](https://www.ema.europa.eu/en/documents/other/screening-adverse-reactions-eudravigilance_en.pdf), we extend the original Wilson-based labeling rule by incorporating the reporting odds ratio (ROR) to assess whether an ADE is disproportionately reported for a drug regimen relative to other regimens. 
+Inspired by the EMA’s [*Screening for adverse reactions in EudraVigilance*](https://www.ema.europa.eu/en/documents/other/screening-adverse-reactions-eudravigilance_en.pdf), we extend the original Wilson-based labeling rule by incorporating the reporting odds ratio (ROR) to assess whether an ADE is disproportionately reported for a drug regimen relative to other regimens.
 
 | Trial group                                       | Target ADE reported | Target ADE not reported |
 | ------------------------------------------------- | ------------------- | ----------------------- |
 | Contains the target drug regimen                  | a                   | b                       |
 | Does not contain the complete target drug regimen | c                   | d                       |
 
-ROR is calculated as \(ROR=ad/(bc)\), where \(a\) and \(b\) count eligible trial groups containing the target regimen—with and without the target ADE, respectively—and \(c\) and \(d\) count the remaining groups with and without that ADE. Reporting is defined by at least one affected participant, independently of Wilson significance, and each group is counted once per ADE. A record is labeled positive only when:
+ROR is calculated as $ROR=ad/(bc)$, where $a$ and $b$ count eligible trial groups containing the target regimen—with and without the target ADE, respectively—and $c$ and $d$ count the remaining groups with and without that ADE. Reporting is defined by at least one affected participant, independently of Wilson significance, and each group is counted once per ADE. A record is labeled positive only when:
 
-- its Wilson lower bound is at least 1%
-- its regimen–ADE pair satisfies \(a>5), \(ROR>2\), and a 95% ROR confidence interval lower bound greater than 1. 
+- Its Wilson lower bound is at least 1%.
+- Its regimen–ADE pair satisfies $a \ge 5$, $ROR > 2$, and $ROR_{\mathrm{lower}} > 1$.
 
-The ROR and its 95% confidence interval lower bound are calculated as:
-$$
-ROR=\frac{ad}{bc}, \qquad ROR_{\mathrm{lower}}= \exp\left[\ln(ROR)-1.96\sqrt{\frac1a+\frac1b+\frac1c+\frac1d}\right].
-$$
- with 0.5 added to all four cells if any cell is zero; the minimum report count uses the uncorrected \(a\).
+The ROR and its 95% confidence interval lower bound are calculated as follows.
+
+```math
+ROR = \frac{ad}{bc}, \qquad
+ROR_{\mathrm{lower}} = \exp\left[\ln(ROR) - 1.96\sqrt{\frac{1}{a} + \frac{1}{b} + \frac{1}{c} + \frac{1}{d}}\right].
+```
+
+If any cell is zero, we add 0.5 to all four cells for the ROR and confidence interval calculations. The minimum report count uses the uncorrected $a$.
 
 ------
 
@@ -67,4 +70,3 @@ We derive CT-ADE-CS by identifying positive combination–ADE pairs for which no
 | 3               | 8                              | 25            |
 | 4               | 1                              | 1             |
 | **Total**       | **583**                        | **1,909**     |
-
