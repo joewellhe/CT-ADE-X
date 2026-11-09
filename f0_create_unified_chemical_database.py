@@ -33,15 +33,46 @@ def canonical_smiles(smiles: str) -> Optional[str]:
     """
     Generates a canonical SMILES string from the given SMILES input.
     """
+    if not isinstance(smiles, str) or not smiles.strip():
+        logging.warning("Missing or non-string SMILES: %r", smiles)
+        return None
     mol = Chem.MolFromSmiles(smiles, sanitize=False)  # Disable auto-sanitization
     if mol:
         try:
             Chem.SanitizeMol(mol)  # Manual sanitization to control error handling
-            return Chem.MolToSmiles(mol, canonical=True)
+            return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
         except Exception as e:
             logging.warning(f"Error processing SMILES '{smiles}': {e}")
     else:
         logging.warning(f"Failed to parse SMILES '{smiles}'")
+    return None
+
+
+def connectivity_smiles(smiles: str) -> Optional[str]:
+    """
+    Generates a canonical connectivity-level SMILES string.
+
+    Stereochemistry and isotope information are not encoded in this representation.
+    This value is used only to link related exact-structure clusters; it must not
+    be used to merge exact compounds.
+    """
+    if not isinstance(smiles, str) or not smiles.strip():
+        logging.warning("Missing or non-string SMILES for connectivity: %r", smiles)
+        return None
+
+    mol = Chem.MolFromSmiles(smiles, sanitize=False)
+    if mol:
+        try:
+            Chem.SanitizeMol(mol)
+            return Chem.MolToSmiles(
+                mol, canonical=True, isomericSmiles=False
+            )
+        except Exception as e:
+            logging.warning(
+                f"Error processing connectivity SMILES '{smiles}': {e}"
+            )
+    else:
+        logging.warning(f"Failed to parse SMILES for connectivity '{smiles}'")
     return None
 
 
@@ -63,18 +94,23 @@ def canonicalize_and_update_synonyms(
 
     Note:
         Entries with non-canonicalizable SMILES strings are omitted.
-        If the 'synonyms' key is missing or None, it is created with the title as the only synonym.
+        Missing or blank titles are excluded from synonyms. Titles are not used for exact-structure grouping.
     """
     standardized_db = {}
     for key, value in db.items():
-        standardized_smiles = canonical_smiles(value["smiles"])
+        standardized_smiles = canonical_smiles(value.get("smiles"))
         if standardized_smiles:
             value["smiles"] = standardized_smiles
-            if "synonyms" not in value or value["synonyms"] is None:
-                value["synonyms"] = [value["title"]]
-            else:
-                if value["title"] not in value["synonyms"]:
-                    value["synonyms"].append(value["title"])
+            title = value.get("title")
+            value["title"] = title.strip() if isinstance(title, str) and title.strip() else None
+            value["synonyms"] = [
+                synonym.strip() for synonym in (value.get("synonyms") or [])
+                if isinstance(synonym, str) and synonym.strip()
+            ]
+            if value["title"] and value["title"] not in value["synonyms"]:
+                value["synonyms"].append(value["title"])
+            if value["title"] is None:
+                logging.warning("%s:%s has no title; grouping by SMILES only", database_name, key)
             # Add source information
             value["source"] = f"{database_name}:{key}"
             standardized_db[key] = value
@@ -155,43 +191,58 @@ def create_unified_database(
     *dbs: Dict[str, Dict[str, Any]]
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Combines multiple databases into a unified database, grouping compounds based on their SMILES and titles.
+    Combines multiple databases into a unified database.
+
+    Exact compound clusters are formed strictly by canonical, stereo-aware SMILES.
+    Titles are retained as descriptive/candidate information only and never trigger
+    a Union-Find merge. This prevents stereo-defined, stereo-unspecified, or distinct
+    stereoisomer records with the same title from being collapsed into one compound.
 
     Args:
-        *dbs (Dict[str, Dict[str, Any]]): Variable number of dictionaries representing databases,
-            each with compound identifiers as keys and dictionaries as values.
+        *dbs: Variable number of dictionaries representing source databases.
 
     Returns:
-        Dict[str, Dict[str, Any]]: A unified database with compound identifiers as keys
-            and dictionaries as values, where each dictionary represents a compound.
+        A unified database in the same intermediate structure used by the downstream
+        pipeline.
     """
     uf = UnionFind()
     key_to_details = {}
     smiles_to_key = {}
-    title_to_key = {}
+    title_to_keys: Dict[str, List[Any]] = {}
 
-    # First pass: Assign each compound a group based on SMILES and title.
+    # First pass: exact-structure grouping by stereo-aware canonical SMILES only.
     for db in dbs:
         for key, details_ in db.items():
             details = deepcopy(details_)
             details.update({"key": key})  # Store the original key for reference
             smiles = details["smiles"]
-            title = details["title"].lower().strip()
 
-            # Ensure each compound has a unique entry in key_to_details
+            # Ensure each compound has a unique entry in key_to_details.
             key_to_details[key] = details
 
-            # Union by SMILES
+            # Exact merge criterion: canonical isomeric SMILES must be identical.
             if smiles not in smiles_to_key:
                 smiles_to_key[smiles] = key
             uf.union(key, smiles_to_key[smiles])
 
-            # Union by title
-            if title not in title_to_key:
-                title_to_key[title] = key
-            uf.union(key, title_to_key[title])
+            # Title is candidate/audit information only; it does NOT trigger union.
+            raw_title = details.get("title")
+            title = raw_title.lower().strip() if isinstance(raw_title, str) else ""
+            if title:
+                title_to_keys.setdefault(title, []).append(key)
 
-    # Second pass: Aggregate compounds by the root of their set.
+    # Optional audit signal: same normalized title attached to multiple exact SMILES.
+    # This intentionally does not change grouping.
+    for title, keys in title_to_keys.items():
+        exact_smiles = {key_to_details[key]["smiles"] for key in keys}
+        if len(exact_smiles) > 1:
+            logging.info(
+                "Same-title candidate spans multiple exact structures: title=%r, keys=%s",
+                title,
+                keys,
+            )
+
+    # Second pass: aggregate compounds by the root of their exact-structure set.
     grouped = {}
     for key in key_to_details:
         root = uf.find(key)
@@ -199,14 +250,14 @@ def create_unified_database(
             grouped[root] = []
         grouped[root].append(key_to_details[key])
 
-    # Format the final output
+    # Format the final output.
     final_db = {}
     counter = 1
     for entries in grouped.values():
         group_id = f"ID_{counter}"
         final_db[group_id] = {
             entry["key"]: entry for entry in entries
-        }  # Use comprehension to collect all entries
+        }
         counter += 1
 
     return final_db
@@ -324,7 +375,8 @@ def create_unique_clean_compounds(
 
         # Aggregate all titles, synonyms, ATC codes, and sources
         for comp_id, details in compounds.items():
-            all_titles.add(details["title"])  # Gather titles
+            if details.get("title"):
+                all_titles.add(details["title"])  # Gather valid titles
             all_synonyms.update(details.get("synonyms", []))  # Gather synonyms
             source_cleaned = details["source"].split("_")[0].strip()  # Remove the suffix after "_"
             all_sources.add(source_cleaned)
@@ -349,13 +401,14 @@ def create_unique_clean_compounds(
         sorted_titles = sorted(
             title_frequencies.items(), key=lambda x: (-x[1], len(x[0]), x[0])
         )
-        selected_title = sorted_titles[0][0]
+        selected_title = sorted_titles[0][0] if sorted_titles else None
 
         # Sort and join ATC codes
         sorted_atc_code = " | ".join(sorted(all_atc_code))
 
-        # Combine all titles and synonyms for a unique list of terms
-        combined_terms = all_titles.union(all_synonyms)
+        # Titles were added to synonyms before ambiguity cleanup. Only retain
+        # the surviving synonyms here, so removed ambiguous titles stay removed.
+        combined_terms = all_synonyms
 
         # Organize the processed data into a new dictionary entry
         unique_clean_compounds[group_id] = {
@@ -367,6 +420,56 @@ def create_unique_clean_compounds(
         }
 
     return unique_clean_compounds
+
+
+def add_connectivity_relationships(
+    unique_compounds: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Adds connectivity-level relationship fields without changing exact clustering.
+
+    Added fields:
+        connectivity_smiles:
+            Canonical SMILES with stereochemistry/isotope information omitted.
+        same_connectivity_cluster_ids:
+            IDs of other exact-structure clusters with the same connectivity_smiles.
+
+    These fields describe a structural family only. They do not assert that the
+    related clusters are necessarily confirmed stereoisomers, because one cluster
+    may be stereo-unspecified.
+    """
+    result = deepcopy(unique_compounds)
+    connectivity_to_cluster_ids: Dict[str, List[str]] = {}
+
+    for group_id, details in result.items():
+        conn_smiles = connectivity_smiles(details.get("smiles"))
+        details["connectivity_smiles"] = conn_smiles
+        details["same_connectivity_cluster_ids"] = []
+
+        if conn_smiles:
+            connectivity_to_cluster_ids.setdefault(conn_smiles, []).append(group_id)
+
+    def cluster_sort_key(group_id: str) -> Tuple[int, str]:
+        try:
+            return (int(group_id.split("_", 1)[1]), group_id)
+        except (IndexError, ValueError):
+            return (10**12, group_id)
+
+    for group_id, details in result.items():
+        conn_smiles = details.get("connectivity_smiles")
+        if not conn_smiles:
+            continue
+
+        related_ids = [
+            related_id
+            for related_id in connectivity_to_cluster_ids.get(conn_smiles, [])
+            if related_id != group_id
+        ]
+        details["same_connectivity_cluster_ids"] = sorted(
+            related_ids, key=cluster_sort_key
+        )
+
+    return result
 
 
 def save_unified_database(
@@ -423,8 +526,11 @@ def main() -> None:
     # Calculate frequency ranking for each SMILES within a compound
     unified_database = add_frequency_ranking(unified_database)
 
-    # Keep only one representation per compound
+    # Keep only one representation per exact compound cluster
     unified_database = create_unique_clean_compounds(unified_database)
+
+    # Add connectivity-level relationships without merging exact structure clusters
+    unified_database = add_connectivity_relationships(unified_database)
 
     output_file_path = Path("./data/unified_chemical_database/unified_chemical_database.json")
     output_folder = output_file_path.parent

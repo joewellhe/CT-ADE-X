@@ -11,10 +11,10 @@ regex==2024.4.16
 Requests==2.32.3
 scikit_learn==1.4.2
 statsmodels==0.14.2
+matplotlib>=3.6
 torch==2.3.0
 tqdm==4.66.2
 transformers==4.42.0.dev0
 tensorboard==2.16.2
 trl==0.8.7.dev0
-wget==3.2
 flash_attn==2.5.9.post1

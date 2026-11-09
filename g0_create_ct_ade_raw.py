@@ -8,9 +8,8 @@ import itertools
 from copy import deepcopy
 from collections import Counter
 import logging
-from rdkit import Chem
 import pandas as pd
-from typing import Optional, Dict, Any, Set, List, Tuple, Iterator, TypeVar, Callable
+from typing import Optional, Dict, Any, Set, List, Tuple, Iterator, TypeVar, Callable, Union
 
 T = TypeVar("T")
 stop_words = set(stopwords.words("english"))
@@ -148,17 +147,70 @@ def sanitize_drug_name(drug: str) -> str:
     return drug
 
 
-def normalize_synonyms(synonyms: Set[str], sanitize: bool = False) -> Set[str]:
+def sanitize_drug_name_tokens(drug: str) -> str:
+    """Remove standalone separators and dose tokens without altering drug names.
+
+    Unlike ``sanitize_drug_name``, punctuation inside a token (for example
+    ``ABT-888`` or ``amoxicillin/clavulanate``) is preserved.
+    """
+    units = r"(?:mg|mcg|µg|ug|g|ml|iu|mmol|nmol|pmol|kg)"
+    amount = rf"\d+(?:\.\d+)?(?:{units}|%)"
+    dose_token = rf"{amount}(?:[-/]{amount})*(?:/(?:m2|m²|kg|day|ml))?"
+    unit_token = rf"{units}(?:/(?:m2|m²|kg|day|ml))?"
+    removable_words = {
+        "oral", "injection", "intravenous", "topical", "nasal",
+        "subcutaneous", "intramuscular", "inhalation", "rectal",
+        "sublingual", "transdermal", "intradermal", "ophthalmic",
+        "otic", "vaginal", "buccal", "enteral", "parenteral",
+        "intravitreal", "tablet", "capsule", "cream", "ointment",
+        "gel", "solution", "suspension", "syrup", "lozenge",
+        "patch", "powder", "aerosol", "emulsion", "spray", "drop",
+        "film", "foam", "implant", "inhaler", "insert", "lotion",
+        "pessary", "suppository",
+    }
+    tokens = drug.lower().split()
+    kept = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        # Split combination doses may span three tokens: "500 mg-125 mg".
+        if (regex.fullmatch(r"\d+(?:\.\d+)?", token)
+                and index + 2 < len(tokens)
+                and regex.fullmatch(rf"{units}-\d+(?:\.\d+)?", tokens[index + 1])
+                and regex.fullmatch(unit_token, tokens[index + 2])):
+            index += 3
+            continue
+        # A separate number and unit form one dose, e.g. "50 mg".
+        if (regex.fullmatch(r"\d+(?:\.\d+)?", token)
+                and index + 1 < len(tokens)
+                and regex.fullmatch(unit_token, tokens[index + 1])):
+            index += 2
+            continue
+        if (regex.fullmatch(dose_token, token)
+                or regex.fullmatch(r"\d+(?:\.\d+)?%", token)
+                or regex.fullmatch(r"[^\p{L}\p{N}]+", token)
+                or token in removable_words):
+            index += 1
+            continue
+        kept.append(token)
+        index += 1
+    return " ".join(kept)
+
+
+def normalize_synonyms(synonyms: Set[str], sanitize: Union[bool, str] = False) -> Set[str]:
     """
     Normalizes a set of drug synonyms by optionally sanitizing them and converting to lowercase.
 
     Args:
         synonyms (Set[str]): A set of synonyms to normalize.
-        sanitize (bool): Whether to sanitize the synonyms. Defaults to False.
+        sanitize (bool or str): True for the original cleanup, "tokens" for
+            whitespace-token cleanup, or False. Defaults to False.
 
     Returns:
         Set[str]: A set of normalized synonyms.
     """
+    if sanitize == "tokens":
+        return {sanitize_drug_name_tokens(synonym) for synonym in synonyms}
     if sanitize:
         return {sanitize_drug_name(synonym).lower().strip() for synonym in synonyms}
     else:
@@ -220,7 +272,8 @@ def get_combined_synonyms(data: Dict[str, Any], drug_id: str) -> List[str]:
         List[str]: List of synonyms including the drug title.
     """
     candidate_data = data.get(str(drug_id), {}) or {}
-    candidate_synonyms = candidate_data.get("synonyms", []) or []
+    # Copy the list: appending the title must not mutate the loaded database.
+    candidate_synonyms = list(candidate_data.get("synonyms", []) or [])
     candidate_title = candidate_data.get("title")
     if candidate_title:
         candidate_synonyms.append(candidate_title)
@@ -286,7 +339,7 @@ def process_trial_group(
     candidate_data: Tuple[List[str], List[Set[str]], List[str], List[str], List[str]],
     trial_chunk: Dict[str, Any],
     match_function: Callable[[Set[str], Set[str]], Any],
-    sanitize: bool,
+    sanitize: Union[bool, str],
 ) -> Tuple[Dict[str, Any], Set[str], Set[str]]:
     """
     Processes a chunk of trial data to map drug IDs to intervention details using predefined synonyms, titles, ATC codes, and sources.
@@ -362,7 +415,7 @@ def process_matching_multiprocessing(
     trial_data: Dict[str, Any],
     drug_id_details: Dict[str, Any],
     match_function: Callable[[Set[str], Set[str]], Optional[str]],
-    sanitize: bool = False,
+    sanitize: Union[bool, str] = False,
     num_processes: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Set[str], Set[str]]:
     """
@@ -484,7 +537,8 @@ def collect_mapped_study_groups(
 def tabularize_study_groups(study_groups: List[Dict[str, Any]]) -> pd.DataFrame:
     """
     Processes a list of clean and mapped study groups, extracting relevant data and sources,
-    then compiling this information into a DataFrame.
+    then compiling this information into a DataFrame. Drug metadata uses the same
+    Drugs JSON-list column as CT-ADE-X, with one drug object per single-drug group.
 
     Args:
         study_groups (List[Dict[str, Any]]): A list of study groups with comprehensive data including
@@ -499,6 +553,21 @@ def tabularize_study_groups(study_groups: List[Dict[str, Any]]) -> pd.DataFrame:
 
     # Iterate over each study group
     for group in study_groups:
+        intervention_details = group["intervention_details"]
+        synonyms = intervention_details.get("synonyms", []) or []
+        if not isinstance(synonyms, list):
+            synonyms = []
+        drug = {
+            "name": intervention_details["name"][0],
+            "synonyms": list(dict.fromkeys(
+                item for item in synonyms if isinstance(item, str)
+            )),
+            "canonical_name": intervention_details["canonical_name"],
+            "drug_id": intervention_details["drug_id"],
+            "smiles": intervention_details["smiles"],
+            "drug_info_source": intervention_details["drug_info_source"],
+            "atc_code": intervention_details["atc_code"],
+        }
 
         # Base information from the study group
         base_info = {
@@ -514,13 +583,8 @@ def tabularize_study_groups(study_groups: List[Dict[str, Any]]) -> pd.DataFrame:
             "enrollment_count": group["enrollment_count"],
             "eligibility_criteria": group["eligibility_criteria"],
             "group_id": group["group_code"],
-            "group_description": group["intervention_details"]["description"],
-            "ct_intervention_name": group["intervention_details"]["name"][0],
-            "canonical_name": group["intervention_details"]["canonical_name"],
-            "drug_info_source": group["intervention_details"]["drug_info_source"],
-            "drug_id": group["intervention_details"]["drug_id"],
-            "smiles": group["intervention_details"]["smiles"],
-            "atc_code": group["intervention_details"]["atc_code"],
+            "group_description": intervention_details["description"],
+            "Drugs": json.dumps([drug], ensure_ascii=False),
         }
 
         # Function to add adverse events to the list
@@ -595,13 +659,17 @@ def calculate_intervention_name_mapping(
             all_intervention_names.add(intervention_name)
 
             # Check if this study group was mapped
-            if "canonical_name" in study_group["intervention_details"]:
+            if "smiles" in study_group["intervention_details"]:
                 mapped_intervention_names.add(intervention_name)
 
     # Calculate the mapping statistics
     total_intervention_names = len(all_intervention_names)
     mapped_names_count = len(mapped_intervention_names)
-    mapping_percentage = (mapped_names_count / total_intervention_names) * 100
+    mapping_percentage = (
+        (mapped_names_count / total_intervention_names) * 100
+        if total_intervention_names
+        else 0.0
+    )
 
     return total_intervention_names, mapped_names_count, mapping_percentage
 
@@ -682,11 +750,30 @@ def main() -> None:
     all_mapped_codes.update(codes_pre_partial)
     all_unique_smiles.update(smiles_pre_partial)
 
+    # Conservative cleanup of whitespace-separated dose and punctuation tokens.
+    # Run last so existing mappings keep their original selected compound.
+    (
+        preprocessed_monopharmacy_cts_mapped,
+        codes_token_exact,
+        smiles_token_exact,
+    ) = process_matching_multiprocessing(
+        preprocessed_monopharmacy_cts_mapped,
+        loaded_compound_details,
+        find_exact_match,
+        sanitize="tokens",
+    )
+    all_mapped_codes.update(codes_token_exact)
+    all_unique_smiles.update(smiles_token_exact)
+
     # Print the final combined summary
     print_summary("Final Combined Results", all_mapped_codes, all_unique_smiles)
 
     # Compute the final mapping percentage
-    mapped_percentage = (len(all_mapped_codes) / unique_study_group_count) * 100
+    mapped_percentage = (
+        (len(all_mapped_codes) / unique_study_group_count) * 100
+        if unique_study_group_count
+        else 0.0
+    )
     print(
         f"Among the {unique_study_group_count} unique study groups, {len(all_mapped_codes)} were mapped ({mapped_percentage:.2f}%)\n"
     )

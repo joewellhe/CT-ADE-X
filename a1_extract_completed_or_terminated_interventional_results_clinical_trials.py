@@ -27,27 +27,14 @@ def load_json_data(file_path: Path) -> dict:
 
 
 def criteria_check(data: dict) -> bool:
-    """Check if the JSON data meets specific criteria: Completed, Interventional with ResultsSection."""
+    """Select completed or terminated interventional API v2 studies with results."""
     try:
-        if (
-            ("Study" in data["FullStudy"])
-            and (
-                data["FullStudy"]["Study"]["ProtocolSection"]["StatusModule"][
-                    "OverallStatus"
-                ]
-                in ["Completed", "Terminated"]
-            )
-            and (
-                data["FullStudy"]["Study"]["ProtocolSection"]["DesignModule"][
-                    "StudyType"
-                ]
-                == "Interventional"
-            )
-            and ("ResultsSection" in data["FullStudy"]["Study"])
-        ):
-            return True
-        else:
-            return False
+        protocol = data["protocolSection"]
+        return (
+            protocol["statusModule"]["overallStatus"] in ["COMPLETED", "TERMINATED"]
+            and protocol["designModule"]["studyType"] == "INTERVENTIONAL"
+            and "resultsSection" in data
+        )
     except KeyError as e:
         logging.debug(f"Key error: {str(e)} in data")
         return False

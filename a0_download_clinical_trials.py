@@ -1,11 +1,20 @@
-import wget
+import logging
+import tempfile
 import zipfile
 from pathlib import Path
-import logging
+
+import requests
+
+
+# Official replacement for the retired classic bulk download:
+# https://clinicaltrials.gov/data-api/about-api/api-migration
+BULK_DOWNLOAD_URL = "https://clinicaltrials.gov/api/v2/studies/download?format=json.zip"
+
 
 def setup_logging() -> None:
     """Set up basic logging configuration."""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 def download_and_extract_zip(url: str, directory: Path, filename: str) -> None:
     """
@@ -19,45 +28,52 @@ def download_and_extract_zip(url: str, directory: Path, filename: str) -> None:
     Raises:
         Exception: If downloading or extracting the ZIP file fails.
     """
-    # Ensure the directory exists
     directory.mkdir(parents=True, exist_ok=True)
-    
-    # Define the path for the ZIP file
     zip_file_path = directory / filename
+    temporary_path = None
 
-    # Download the ZIP file
     try:
-        wget.download(url, out=str(zip_file_path))
-        logging.info(f"ZIP file downloaded successfully: {zip_file_path}")
-    except Exception as e:
-        logging.error(f"Failed to download the ZIP file from {url}: {str(e)}")
-        raise
-    
-    # Extract the ZIP file
-    try:
-        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        logging.info("Downloading clinical trials from %s", url)
+        with requests.get(url, stream=True, timeout=(30, 300)) as response:
+            response.raise_for_status()
+            # Retired endpoints can redirect to an HTML page with HTTP 200.
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "text/html" in content_type:
+                raise ValueError(f"Expected a ZIP archive, received HTML from {response.url}")
+            with tempfile.NamedTemporaryFile(
+                dir=directory, prefix=filename + ".", suffix=".part", delete=False
+            ) as output:
+                temporary_path = Path(output.name)
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+
+        # Opening the archive also rejects invalid downloads with a misleading
+        # Content-Type. Preserve an existing ZIP until extraction succeeds.
+        with zipfile.ZipFile(temporary_path, "r") as zip_ref:
             zip_ref.extractall(directory)
-        logging.info(f"ZIP file extracted successfully in {directory}")
-    except zipfile.BadZipFile as e:
-        logging.error(f"The file is not a ZIP file or it is corrupted: {str(e)}")
-        raise
-    except Exception as e:
-        logging.error(f"Failed to extract the ZIP file: {str(e)}")
-        raise
+        temporary_path.replace(zip_file_path)
+        logging.info("ZIP file downloaded and extracted successfully: %s", zip_file_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
-def main() -> None:
+
+def main() -> int:
     """
     Main function to handle the downloading and extracting of a ZIP file.
     """
     setup_logging()
-    url = "https://classic.clinicaltrials.gov/AllAPIJSON.zip"
     all_cts_dir = Path('data/clinicaltrials_gov/all_cts')
     filename = 'AllAPIJSON.zip'
 
     try:
-        download_and_extract_zip(url, all_cts_dir, filename)
+        download_and_extract_zip(BULK_DOWNLOAD_URL, all_cts_dir, filename)
     except Exception as e:
-        logging.error(f"An error occurred during the process: {str(e)}")
+        logging.error("Failed to download or extract clinical trials: %s", e)
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
