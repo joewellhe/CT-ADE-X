@@ -1,6 +1,6 @@
 # Generated and downloaded datasets
 data/**
-analysis/ct_ade_statistics/
+analysis/**/
 
 # Keep the repository's empty data-directory placeholders
 !data/**/
@@ -8,6 +8,7 @@ analysis/ct_ade_statistics/
 
 *.sh
 *.log
+note.txt
 
 multi-drug-dev/
 __pycache__/

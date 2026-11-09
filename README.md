@@ -1,214 +1,70 @@
-# CT-ADE
-CT-ADE: An Evaluation Benchmark for Adverse Drug Event Prediction from Clinical Trial Results
+# CT-ADE-X: Update Note
+CT-ADE-X: An Expanded [CT-ADE](https://github.com/ds4dh/CT-ADE.git) Benchmark for Adverse Drug Event Prediction from Clinical Trial Results
 
-## Citation
+------
 
-```
-@article{yazdani2025evaluation,
-  title={An Evaluation Benchmark for Adverse Drug Event Prediction from Clinical Trial Results},
-  author={Yazdani, Anthony and Bornet, Alban and Khlebnikov, Philipp and Zhang, Boya and Rouhizadeh, Hossein and Amini, Poorya and Teodoro, Douglas},
-  journal={Scientific Data},
-  volume={12},
-  number={1},
-  pages={1--12},
-  year={2025},
-  publisher={Nature Publishing Group}
-}
-```
+CT-ADE-X extends the original CT-ADE benchmark in follows 4 aspects: 
 
-## Developed with
+(1) Whereas CT-ADE focuses on single-drug interventions, CT-ADE-X additionally incorporates clinical trial arms involving multiple drugs ($n>1$), supporting ADE prediction for both individual drugs and drug combinations. 
 
-- Operating System: Ubuntu 22.04.3 LTS
-    - Kernel: Linux 4.18.0-513.18.1.el8_9.x86_64
-    - Architecture: x86_64
-- Python:
-    - 3.10.12
+(2) Second, we refine the dataset by excluding predefined MedDRA preferred terms outside the intended scope of drug-reaction prediction, including selected terms related to medication-use issues, device problems, and external exposures. 
 
-## Prerequisites
+(3) Third, inspired by the EMA’s [*Screening for adverse reactions in EudraVigilance*](https://www.ema.europa.eu/en/documents/other/screening-adverse-reactions-eudravigilance_en.pdf), we adapt reporting odds ratio (ROR) analysis to clinical trial groups and combine it with the existing Wilson criterion. Positive labels require a Wilson lower bound of at least 1%, an ROR greater than 2, a 95% ROR confidence interval lower bound greater than 1, and at least five reporting groups, thereby incorporating evidence of disproportionate reporting relative to other drug regimens. 
 
-1. Set up your environment and install the necessary Python libraries as specified in `requirements.txt`. Note that you will need to install the development versions of certain libraries from their respective Git repositories.
-2. Place your unzipped MedDRA files in the directory `./data/MedDRA_25_0_English` and your DrugBank XML database in the directory `./data/drugbank`.
+(4) Finally, we introduce **CT-ADE-CS (Candidate Combination-Specific Adverse Drug Events)**, a subset retaining positive combination–ADE pairs for which no nonempty proper drug subset exhibits the same positive signal in the available data, supporting investigation of potentially combination-specific safety signals.
 
-Ensure you clone and install the following libraries directly from their Git repositories for the development versions:
+------
 
-- [`transformers`](https://github.com/huggingface/transformers)
-- [`trl`](https://github.com/huggingface/trl)
+### Multi-Drug Expansion
 
-## Repository Structure
+**Trial selection.** We select completed or terminated interventional studies with posted results from ClinicalTrials.gov, focusing on trials with drug-only interventions after excluding placebo controls.
 
-```plaintext
-.
-├── a0_download_clinical_trials.py
-├── a1_extract_completed_or_terminated_interventional_results_clinical_trials.py
-├── a2_extract_and_preprocess_monopharmacy_clinical_trials.py
-├── b0_download_pubchem_cids.py
-├── b1_download_pubchem_cid_details.py
-├── c0_extract_drugbank_dbid_details.py
-├── d0_extract_chembl_approved_CHEMBL_details.py
-├── data
-│   ├── MedDRA_25_0_English
-│   │   └── empty.null
-│   ├── chembl_approved
-│   │   └── empty.null
-│   ├── chembl_usan
-│   │   └── empty.null
-│   ├── clinicaltrials_gov
-│   │   └── empty.null
-│   ├── drugbank
-│   │   └── empty.null
-│   └── pubchem
-│       └── empty.null
-├── e0_extract_chembl_usan_CHEMBL_details.py
-├── f0_create_unified_chemical_database.py
-├── g0_create_ct_ade_raw.py
-├── g1_create_ct_ade_meddra.py
-├── g2_create_ct_ade_classification_datasets.py
-├── g3_create_ct_ade_friendly_labels.py
-├── modeling
-│   ├── DLLMs
-│   │   ├── config.py
-│   │   ├── custom_metrics.py
-│   │   ├── model.py
-│   │   ├── train.py
-│   │   └── utils.py
-│   └── GLLMs
-│       ├── config-llama3.py
-│       ├── config-meditron.py
-│       ├── config-openbiollm.py
-│       ├── config.py
-│       ├── train_S.py
-│       ├── train_SG.py
-│       └── train_SGE.py
-├── requirements.txt
-└── src
-    └── meddra_graph.py
-```
+**Multi-drug arm identification.** We identify protocol arms containing at least two distinct active drugs and link them to result groups using arm labels, drug names, and synonyms. We require the complete drug set of a uniquely identifiable arm, excluding incomplete or ambiguous matches.
 
-## Download Publically Available CT-ADE-SOC and CT-ADE-PT
+**Adverse event alignment.** We match the selected result groups to their adverse event reporting groups using group titles and descriptions. For each matched group, we extract serious and other adverse events together with the affected and at-risk participant counts.
 
-You can download the publicly available CT-ADE-SOC and CT-ADE-PT versions from HuggingFace. These datasets contain standardized annotations from ClinicalTrials.gov:
+**Independent model validation.** GPT and DeepSeek independently assess whether the extracted drug list exactly matches the active drugs described for each group, including background and supportive treatments. Missing or extra drugs and insufficiently informative descriptions lead to rejection.
 
-- [`CT-ADE-SOC`](https://huggingface.co/datasets/anthonyyazdaniml/CT-ADE-SOC)
-- [`CT-ADE-PT`](https://huggingface.co/datasets/anthonyyazdaniml/CT-ADE-PT)
+**Consensus filtering.** We merge the two models’ assessments and retain only groups approved by both models. Trials with no retained groups are excluded from the final multi-drug collection.
 
-Alternatively, the datasets are also available on Figshare:
+------
 
-- [`CT-ADE-SOC & CT-ADE-PT`](https://figshare.com/articles/dataset/28142453)
+### ADE Term Exclusion
 
-The above datasets are identical to the SOC and PT versions you will produce in the `Typical Pipeline from Checkpoint` section.
+To focus the benchmark on drug-reaction prediction, we exclude records mapped to 81 predefined MedDRA preferred terms (PTs) outside the intended study scope. These terms cover overdose, underdose and dosing errors; prescribing and administration errors; substance abuse and selected alcohol-related conditions; product quality and use issues; device and vascular-access malfunctions; selected procedure-related failures; and external exposures, poisoning, accidents and injuries. ADE records matching any excluded PT code are removed, while other event records and the drug composition of the same treatment group are preserved.
 
-## Typical Pipeline from Checkpoint
+------
 
-Follow this procedure if you aim to recreate the dataset detailed in our paper (CT-ADE-SOC, CT-ADE-PT).
+### Positive Criteria Modification
 
-### 1. Place your data
-Place your unzipped MedDRA files in the directory `./data/MedDRA_25_0_English` and your DrugBank XML database in the directory `./data/drugbank`.
+Inspired by the EMA’s [*Screening for adverse reactions in EudraVigilance*](https://www.ema.europa.eu/en/documents/other/screening-adverse-reactions-eudravigilance_en.pdf), we extend the original Wilson-based labeling rule by incorporating the reporting odds ratio (ROR) to assess whether an ADE is disproportionately reported for a drug regimen relative to other regimens. 
 
-### 2. Download checkpoint from HuggingFace
-Download [`chembl_approved, chembl_usan, clinicaltrials_gov, pubchem`](https://huggingface.co/datasets/anthonyyazdaniml/CTADE_v1_initial_release_checkpoint) files and place them accordingly.
+| Trial group                                       | Target ADE reported | Target ADE not reported |
+| ------------------------------------------------- | ------------------- | ----------------------- |
+| Contains the target drug regimen                  | a                   | b                       |
+| Does not contain the complete target drug regimen | c                   | d                       |
 
-### 3. Extract DrugBank DBID Details
+ROR is calculated as \(ROR=ad/(bc)\), where \(a\) and \(b\) count eligible trial groups containing the target regimen—with and without the target ADE, respectively—and \(c\) and \(d\) count the remaining groups with and without that ADE. Reporting is defined by at least one affected participant, independently of Wilson significance, and each group is counted once per ADE. A record is labeled positive only when:
 
-Extract drug details from the DrugBank database.
+- its Wilson lower bound is at least 1%
+- its regimen–ADE pair satisfies \(a>5), \(ROR>2\), and a 95% ROR confidence interval lower bound greater than 1. 
 
-```bash
-python c0_extract_drugbank_dbid_details.py
-```
+The ROR and its 95% confidence interval lower bound are calculated as:
+$$
+ROR=\frac{ad}{bc}, \qquad ROR_{\mathrm{lower}}= \exp\left[\ln(ROR)-1.96\sqrt{\frac1a+\frac1b+\frac1c+\frac1d}\right].
+$$
+ with 0.5 added to all four cells if any cell is zero; the minimum report count uses the uncorrected \(a\).
 
-### 4. Create Unified Chemical Database
+------
 
-Create a unified database combining information from PubChem, DrugBank, and ChEMBL.
+### CT-ADE-CS (Candidate Combination-Specific Adverse Drug Events)
 
-```bash
-python f0_create_unified_chemical_database.py
-```
+We derive CT-ADE-CS by identifying positive combination–ADE pairs for which no smaller drug subset exhibits the same positive signal in the available data. For each multi-drug regimen, we examine all observed nonempty proper subsets, including individual drugs and smaller combinations, across trials and both serious and other adverse events. A combination–ADE pair is excluded if any subset meets the same joint Wilson and ROR positivity criteria for that ADE. The retained pairs constitute candidate combination-specific safety signals for further investigation; their retention does not establish causal drug interactions, particularly when subset evidence is incomplete.
 
-### 5. Create Raw CT-ADE Dataset
+| Number of drugs | Retained combination–ADE pairs | Retained rows |
+| --------------- | ------------------------------ | ------------- |
+| 2               | 574                            | 1,883         |
+| 3               | 8                              | 25            |
+| 4               | 1                              | 1             |
+| **Total**       | **583**                        | **1,909**     |
 
-Generate the raw CT-ADE dataset from the processed clinical trials data.
-
-```bash
-python g0_create_ct_ade_raw.py
-```
-
-### 6. Create MedDRA Annotations
-
-Annotate the CT-ADE dataset with MedDRA terms.
-
-```bash
-python g1_create_ct_ade_meddra.py
-```
-
-### 7. Create Classification Datasets
-
-Generate the final classification datasets for modeling.
-
-```bash
-python g2_create_ct_ade_classification_datasets.py
-```
-
-### 8. (Optional) Create User-Friendly Labels
-
-As an optional step, you can create a version of the dataset where MedDRA codes are replaced with user-friendly text labels. To do this, run the following command:
-
-```bash
-python g3_create_ct_ade_friendly_labels.py
-```
-
-## Training Models
-
-### Discriminative Models (DLLMs)
-
-Navigate to the `modeling/DLLMs` directory and run the training scripts with the desired configuration.
-
-```bash
-cd modeling/DLLMs
-```
-
-For single-GPU training, use this command:
-
-```bash
-export CUDA_VISIBLE_DEVICES="0"; \
-export MIXED_PRECISION="bf16"; \
-FIRST_GPU=$(echo $CUDA_VISIBLE_DEVICES | cut -d ',' -f 1); \
-BASE_PORT=29500; \
-PORT=$(( $BASE_PORT + $FIRST_GPU )); \
-accelerate launch \
---mixed_precision=$MIXED_PRECISION \
---num_processes=$(( $(echo $CUDA_VISIBLE_DEVICES | grep -o "," | wc -l) + 1 )) \
---num_machines=1 \
---dynamo_backend=no \
---main_process_port=$PORT \
-train.py
-```
-
-For multi-GPU training, use this command:
-
-```bash
-export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"; \
-export MIXED_PRECISION="bf16"; \
-FIRST_GPU=$(echo $CUDA_VISIBLE_DEVICES | cut -d ',' -f 1); \
-BASE_PORT=29500; \
-PORT=$(( $BASE_PORT + $FIRST_GPU )); \
-accelerate launch \
---mixed_precision=$MIXED_PRECISION \
---num_processes=$(( $(echo $CUDA_VISIBLE_DEVICES | grep -o "," | wc -l) + 1 )) \
---num_machines=1 \
---dynamo_backend=no \
---main_process_port=$PORT \
-train.py
-```
-
-### Generative Models (GLLMs)
-
-Navigate to the `modeling/GLLMs` directory and run the training scripts for different configurations.
-
-```bash
-cd modeling/GLLMs
-```
-
-Example configurations for LLama3, OpenBioLLM, and Meditron are provided in the folder. You can copy the desired configuration into `config.py` and adjust it to your convenience. Next, you can execute the following for the SGE configuration:
-
-```bash
-python train_SGE.py
-```

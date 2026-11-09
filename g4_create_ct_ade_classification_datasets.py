@@ -1,3 +1,23 @@
+"""Build strict Wilson AND group-based ROR classification datasets.
+
+Default input: ./data/ct_ade/all_ct_ade_meddra.csv (the g3 merged CSV).
+Use --input to supply a different full reference population.
+
+--scope single-only / multi-only / all (default: all) controls exported groups
+only. Wilson, ROR, and regimen-level train/val/test assignments are computed
+using the full input before scope filtering. Single-drug groups contain one
+distinct drug SMILES; multi-drug groups contain at least two.
+
+Outputs: <output-dir>/<scope>/{event_type,soc,hlgt,hlt,pt}/.
+The default output-dir is ./data/ct_ade. Each scope's ror_statistics/ directory
+contains the full-input ROR audit, including combinations outside that scope.
+
+Examples:
+  python g4_create_ct_ade_classification_datasets.py --scope single-only
+  python g4_create_ct_ade_classification_datasets.py --scope multi-only
+  python g4_create_ct_ade_classification_datasets.py --scope all
+"""
+
 import pandas as pd
 import numpy as np
 import json
@@ -5,6 +25,7 @@ from statsmodels.stats.proportion import proportion_confint
 from multiprocessing import Pool, cpu_count
 from tqdm.auto import tqdm
 import warnings
+import argparse
 from typing import Dict, List, Tuple, Any, Optional
 from src.meddra_graph import MedDRA, Node
 from sklearn.model_selection import train_test_split
@@ -12,6 +33,8 @@ from copy import deepcopy
 from pathlib import Path
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+DATASET_SCOPES = ("single-only", "multi-only", "all")
 
 
 def do_chunks(lst, n):
@@ -44,7 +67,8 @@ def apply_wilson_lower_bound(row: pd.Series) -> float:
     Returns:
         float: The lower bound of the Wilson score interval, or NaN if conditions are not met.
     """
-    if row["ade_num_affected"] >= 0 and row["ade_num_at_risk"] > 0:
+    affected, at_risk = row["ade_num_affected"], row["ade_num_at_risk"]
+    if np.isfinite(affected) and np.isfinite(at_risk) and 0 <= affected <= at_risk and at_risk > 0:
         ci_lower, _ = proportion_confint(
             count=row["ade_num_affected"],
             nobs=row["ade_num_at_risk"],
@@ -74,6 +98,108 @@ def process_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
     return chunk
 
 
+def group_reporting_odds_ratio(a: int, b: int, c: int, d: int) -> Tuple[float, float]:
+    """ROR and two-sided 95% log-Wald lower bound from distinct-group counts.
+
+    Apply a 0.5 correction to all four cells only when a cell is zero.
+    An absent target or comparator population is not estimable.
+    """
+    if a + b == 0 or c + d == 0:
+        return np.nan, np.nan
+    cells = np.array([a, b, c, d], dtype=float)
+    if (cells == 0).any():
+        cells += 0.5
+    aa, bb, cc, dd = cells
+    log_ror = np.log(aa) + np.log(dd) - np.log(bb) - np.log(cc)
+    return float(np.exp(log_ror)), float(np.exp(log_ror - 1.96 * np.sqrt((1 / cells).sum())))
+
+
+def add_group_ror_significance(df: pd.DataFrame, level: str) -> pd.DataFrame:
+    """Add strict row labels in place; return auditable regimen/code ROR counts.
+
+    A report means affected > 0, independently of Wilson. Each group contributes
+    once per code. A target regimen matches every group containing all its SMILES
+    (including supersets); the comparator is its disjoint complement. The group
+    universe is built before filtering reports, so zero-report groups remain.
+    Groups with invalid counts or an unmapped observed event at this level are
+    excluded from this level's ROR universe rather than counted as nonreports.
+    ROR is an offline label statistic computed on the supplied full input.
+    """
+    code_col = "event_type" if level == "event_type" else f"ade_mapped_code_{level}"
+    if df["group_id"].isna().any() or df["smiles"].isna().any():
+        raise ValueError("group_id and smiles are required for group-based ROR")
+    if df.groupby("group_id")["smiles"].nunique().gt(1).any():
+        raise ValueError("A group_id must identify exactly one drug combination")
+
+    event_rows = df["event_type"].ne("No Event")
+    affected = pd.to_numeric(df["ade_num_affected"], errors="coerce")
+    at_risk = pd.to_numeric(df["ade_num_at_risk"], errors="coerce")
+    valid = (np.isfinite(affected) & np.isfinite(at_risk)
+             & affected.ge(0) & at_risk.gt(0) & affected.le(at_risk))
+    observed = event_rows & affected.gt(0)
+    invalid = ~valid | (observed & df[code_col].isna())
+    if level == "event_type":
+        invalid |= event_rows & ~df[code_col].isin(["Serious", "Other"])
+    excluded = set(df.loc[invalid, "group_id"])
+    eligible = ~df["group_id"].isin(excluded)
+    group_regimens = df.loc[eligible, ["group_id", "smiles"]].drop_duplicates()
+    group_bits = {group: 1 << i for i, group in enumerate(group_regimens["group_id"])}
+    universe = (1 << len(group_bits)) - 1
+
+    regimen_drugs = {key: frozenset(json.loads(key)) for key in df["smiles"].unique()}
+    if any(not drugs for drugs in regimen_drugs.values()):
+        raise ValueError("A regimen must contain at least one drug")
+    drug_masks: Dict[str, int] = {}
+    for group, regimen in group_regimens.itertuples(index=False, name=None):
+        for drug in regimen_drugs[regimen]:
+            drug_masks[drug] = drug_masks.get(drug, 0) | group_bits[group]
+
+    report_masks: Dict[str, int] = {}
+    reports = df.loc[eligible & observed, ["group_id", code_col]].drop_duplicates()
+    for group, code in reports.itertuples(index=False, name=None):
+        report_masks[code] = report_masks.get(code, 0) | group_bits[group]
+
+    # Only pairs present in the input need a label. Absent codes stay zero in
+    # the downstream vocabulary pivot; no huge regimen x vocabulary grid is built.
+    pairs = df.loc[event_rows & df[code_col].notna(), ["smiles", code_col]].drop_duplicates()
+    positive_pairs = set()
+    records = []
+    for regimen, regimen_pairs in pairs.groupby("smiles", sort=False):
+        target = universe
+        for drug in regimen_drugs[regimen]:
+            target &= drug_masks.get(drug, 0)
+        other = universe ^ target
+        n_target, n_other = target.bit_count(), other.bit_count()
+        for code in regimen_pairs[code_col]:
+            report = report_masks.get(code, 0)
+            a = (report & target).bit_count()
+            c = (report & other).bit_count()
+            b, d = n_target - a, n_other - c
+            ror, lower = group_reporting_odds_ratio(a, b, c, d)
+            positive = bool(a >= 5 and ror > 2 and lower > 1)
+            if positive:
+                positive_pairs.add((regimen, code))
+            records.append({
+                "smiles": regimen, "code": code, "a": a, "b": b, "c": c, "d": d,
+                "ror": ror, "ror_ci_lower": lower, "ror_positive": positive,
+                "estimable": bool(np.isfinite(ror)),
+                "zero_cell_corrected": bool(np.isfinite(ror) and min(a, b, c, d) == 0),
+                "eligible_group_count": len(group_bits), "excluded_group_count": len(excluded),
+            })
+
+    ror_positive = pd.Series(
+        [(regimen, code) in positive_pairs for regimen, code in
+         df[["smiles", code_col]].itertuples(index=False, name=None)], index=df.index
+    )
+    df[f"strict_positive_{level}"] = (
+        df["is_significant"].eq(True) & ror_positive & event_rows & eligible
+    )
+    return pd.DataFrame(records, columns=[
+        "smiles", "code", "a", "b", "c", "d", "ror", "ror_ci_lower", "ror_positive",
+        "estimable", "zero_cell_corrected", "eligible_group_count", "excluded_group_count",
+    ])
+
+
 def event_type_classification(group_df: pd.DataFrame) -> pd.Series:
     """
     Classify the event type based on significance and the type of event.
@@ -85,7 +211,7 @@ def event_type_classification(group_df: pd.DataFrame) -> pd.Series:
         pd.Series: A series with labels indicating the presence of serious, other, or no significant events.
     """
     events = group_df["event_type"]
-    significance = group_df["is_significant"]
+    significance = group_df["strict_positive_event_type"]
 
     has_serious_event = float(any((events == "Serious") & significance))
     has_other_event = float(any((events == "Other") & significance))
@@ -212,7 +338,8 @@ def process_group_data(
 
     # 3) Create label pivot
     bool_map = {True: 1, False: 0, np.nan: np.nan}
-    group_label_info = group_df[[f"ade_mapped_code_{level}", "is_significant"]].copy()
+    group_label_info = group_df[[f"ade_mapped_code_{level}", f"strict_positive_{level}"]].copy()
+    group_label_info.rename(columns={f"strict_positive_{level}": "is_significant"}, inplace=True)
     group_label_info["is_significant"] = group_label_info["is_significant"].map(bool_map)
 
     label_dummies = group_label_info.pivot(
@@ -321,7 +448,29 @@ def extract_group_drug_fields(drugs_json: str) -> Dict[str, str]:
     }
 
 
-def main() -> None:
+def select_dataset_scope(df: pd.DataFrame, scope: str) -> pd.DataFrame:
+    """Select output groups only, after full-input label/split computation.
+
+    Use the same drug identity as ROR: distinct SMILES, not the number of JSON
+    records (duplicate entries for one drug do not make a combination).
+    """
+    if scope not in DATASET_SCOPES:
+        raise ValueError(f"Unknown scope {scope!r}; choose from {DATASET_SCOPES}")
+    if scope == "all":
+        return df
+    drug_counts = {key: len(set(json.loads(key))) for key in df["smiles"].unique()}
+    counts = df["smiles"].map(drug_counts)
+    keep = counts.eq(1) if scope == "single-only" else counts.ge(2)
+    return df.loc[keep].copy()
+
+
+def main(
+    output_dir: Optional[str] = None,
+    scope: str = "all",
+    input_path: str = "./data/ct_ade/all_ct_ade_meddra.csv",
+) -> None:
+    if scope not in DATASET_SCOPES:
+        raise ValueError(f"Unknown scope {scope!r}; choose from {DATASET_SCOPES}")
     # Reason maps for rejections
     reason_map_event_type = {
         "Some rows have is_significant=NaN; pass_condition failed.": "reason_is_significant_nan",
@@ -357,7 +506,7 @@ def main() -> None:
     # Load Data
     # -----------------------
     ct_ade_meddra = pd.read_csv(
-        "./data/ct_ade/ct_ade_meddra.csv",
+        input_path,
         dtype={
             "ade_mapped_code_SOC": str,
             "ade_mapped_code_HLGT": str,
@@ -391,6 +540,31 @@ def main() -> None:
         results = list(tqdm(pool.imap(process_chunk, chunks), total=len(chunks)))
 
     ct_ade_meddra = pd.concat(results, ignore_index=True)
+    del chunks, results
+
+    # Scope never changes the reference population used to calculate ROR.
+    output_base = Path(output_dir) if output_dir else Path("./data/ct_ade")
+    output_root = output_base / scope
+    ror_folder = output_root / "ror_statistics"
+    ror_folder.mkdir(parents=True, exist_ok=True)
+    for level in ("event_type", "SOC", "HLGT", "HLT", "PT"):
+        audit = add_group_ror_significance(ct_ade_meddra, level)
+        audit.to_csv(ror_folder / f"{level.lower()}.csv", index=False)
+        print(f"{level}: {audit['ror_positive'].sum()} / {len(audit)} observed regimen/code pairs pass group ROR")
+    del audit
+
+    # Fix split membership from the same full input for every scope. Filtering
+    # first would reshuffle regimens when switching single-only/multi-only/all.
+    unique_smiles = ct_ade_meddra["smiles"].unique()
+    train_smiles, test_smiles = train_test_split(unique_smiles, train_size=0.8, random_state=37)
+    test_val_smiles, val_smiles = train_test_split(test_smiles, train_size=0.1 / (0.1 + 0.1), random_state=37)
+
+    full_group_count = ct_ade_meddra["group_id"].nunique()
+    ct_ade_meddra = select_dataset_scope(ct_ade_meddra, scope)
+    if ct_ade_meddra.empty:
+        raise ValueError(f"No groups match scope={scope!r} in {input_path}")
+    print(f"Full-input reference: {full_group_count} groups; scope={scope}: "
+          f"exporting {ct_ade_meddra['group_id'].nunique()} groups to {output_root}")
 
     # -------------------------------------------------
     # 1) Event Type classification (no freq needed)
@@ -417,16 +591,12 @@ def main() -> None:
         cols = ["group_id"] + list(reason_map_event_type.values())
         rejected_event_type_df = pd.DataFrame(columns=cols)
 
-    # Split train/val/test
-    unique_smiles = ct_ade_meddra["smiles"].unique()
-    train_smiles, test_smiles = train_test_split(unique_smiles, train_size=0.8, random_state=37)
-    test_val_smiles, val_smiles = train_test_split(test_smiles, train_size=0.1 / (0.1 + 0.1), random_state=37)
-
+    # Apply the full-input split assignments to the selected output scope.
     train_df, val_df, test_df = split_dataframe_by_smiles(
         event_type_classification_df, train_smiles, val_smiles, test_val_smiles
     )
 
-    output_folder = Path("./data/ct_ade/event_type")
+    output_folder = output_root / "event_type"
     output_folder.mkdir(parents=True, exist_ok=True)
     train_df.to_csv(output_folder / "train.csv", index=False)
     val_df.to_csv(output_folder / "val.csv", index=False)
@@ -466,7 +636,7 @@ def main() -> None:
 
     # Split into train/val/test
     train_df, val_df, test_df = split_dataframe_by_smiles(SOC_classification_df, train_smiles, val_smiles, test_val_smiles)
-    output_folder = Path("./data/ct_ade/soc")
+    output_folder = output_root / "soc"
     output_folder.mkdir(parents=True, exist_ok=True)
 
     freq_cols = [c for c in train_df.columns if c.startswith("frequency_")]
@@ -527,7 +697,7 @@ def main() -> None:
     )
 
     train_df, val_df, test_df = split_dataframe_by_smiles(HLGT_classification_df, train_smiles, val_smiles, test_val_smiles)
-    output_folder = Path("./data/ct_ade/hlgt")
+    output_folder = output_root / "hlgt"
     output_folder.mkdir(parents=True, exist_ok=True)
 
     freq_cols = [c for c in train_df.columns if c.startswith("frequency_")]
@@ -585,7 +755,7 @@ def main() -> None:
     )
 
     train_df, val_df, test_df = split_dataframe_by_smiles(HLT_classification_df, train_smiles, val_smiles, test_val_smiles)
-    output_folder = Path("./data/ct_ade/hlt")
+    output_folder = output_root / "hlt"
     output_folder.mkdir(parents=True, exist_ok=True)
 
     freq_cols = [c for c in train_df.columns if c.startswith("frequency_")]
@@ -643,7 +813,7 @@ def main() -> None:
     )
 
     train_df, val_df, test_df = split_dataframe_by_smiles(PT_classification_df, train_smiles, val_smiles, test_val_smiles)
-    output_folder = Path("./data/ct_ade/pt")
+    output_folder = output_root / "pt"
     output_folder.mkdir(parents=True, exist_ok=True)
 
     freq_cols = [c for c in train_df.columns if c.startswith("frequency_")]
@@ -672,4 +842,16 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description=("Create CT-ADE labels using Wilson AND group-based ROR "
+                     "(a >= 5, ROR > 2, 95% lower > 1). Calculate labels on the "
+                     "full input, then export the selected drug-count scope.")
+    )
+    parser.add_argument("--input", default="./data/ct_ade/all_ct_ade_meddra.csv",
+                        help="Full reference CSV for label calculation (default: g3 merged CSV)")
+    parser.add_argument("--scope", choices=DATASET_SCOPES, default="all",
+                        help="Groups to export; does not restrict ROR's reference population (default: all)")
+    parser.add_argument("--output-dir", default=None,
+                        help="Base output directory; files go under <base>/<scope>/ (default base: ./data/ct_ade)")
+    args = parser.parse_args()
+    main(output_dir=args.output_dir, scope=args.scope, input_path=args.input)
